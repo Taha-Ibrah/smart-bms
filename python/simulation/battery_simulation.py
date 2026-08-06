@@ -129,34 +129,155 @@ current_axis = axes[0][1]
 temperature_axis = axes[1][0]
 soc_axis = axes[1][1]
 
+# suptitle() adds one heading for the complete figure, above the subplot titles.
+figure.suptitle(
+    "PyBaMM Battery Simulation: 10 Minute Rest Followed by 1C Discharge",
+    fontsize=16,
+    fontweight="bold",
+)
+
 # .plot(x, y) calls the plotting method on one Axes object. Here, time is the
 # x-coordinate array and the simulated measurement is the y-coordinate array.
-voltage_axis.plot(time_h, voltage_v)
+# The other keyword arguments control the line's color, width, markers, and label.
+voltage_axis.plot(
+    time_h,
+    voltage_v,
+    color="tab:blue",
+    linewidth=2,
+    marker="o",
+    markevery=[0, -1],
+    label="Terminal voltage",
+)
+voltage_axis.axhline(
+    minimum_voltage_v,
+    color="tab:red",
+    linestyle="--",
+    label=f"Minimum limit ({minimum_voltage_v:.1f} V)",
+)
+voltage_axis.axhline(
+    maximum_voltage_v,
+    color="tab:green",
+    linestyle="--",
+    label=f"Maximum limit ({maximum_voltage_v:.1f} V)",
+)
 # Dot notation calls methods that title this subplot and label both axes.
 voltage_axis.set_title("Terminal Voltage vs. Time")
 voltage_axis.set_xlabel("Time [h]")
 voltage_axis.set_ylabel("Voltage [V]")
 
-current_axis.plot(time_h, current_a)
+current_axis.plot(
+    time_h,
+    current_a,
+    color="tab:orange",
+    linewidth=2,
+    marker="o",
+    markevery=[0, -1],
+    label="Applied current",
+)
+current_axis.axhline(
+    0,
+    color="black",
+    linewidth=1,
+    linestyle="--",
+    label="Zero-current reference",
+)
 current_axis.set_title("Current vs. Time")
 current_axis.set_xlabel("Time [h]")
 current_axis.set_ylabel("Current [A]")
 
-temperature_axis.plot(time_h, temperature_c)
+temperature_axis.plot(
+    time_h,
+    temperature_c,
+    color="tab:red",
+    linewidth=2,
+    marker="o",
+    markevery=[0, -1],
+    label="Cell temperature",
+)
+temperature_axis.axhline(
+    minimum_temp_c,
+    color="tab:blue",
+    linestyle="--",
+    label=f"Minimum limit ({minimum_temp_c:.0f} °C)",
+)
+temperature_axis.axhline(
+    maximum_temp_c,
+    color="tab:red",
+    linestyle="--",
+    label=f"Maximum limit ({maximum_temp_c:.0f} °C)",
+)
 temperature_axis.set_title("Cell Temperature vs. Time")
 temperature_axis.set_xlabel("Time [h]")
 temperature_axis.set_ylabel("Temperature [°C]")
 
-soc_axis.plot(time_h, true_soc_percent)
+soc_axis.plot(
+    time_h,
+    true_soc_percent,
+    color="tab:green",
+    linewidth=2,
+    marker="o",
+    markevery=[0, -1],
+    label="Calculated SOC",
+)
+soc_axis.axhline(
+    20,
+    color="tab:red",
+    linestyle="--",
+    label="Low-SOC reference (20%)",
+)
 soc_axis.set_title("State of Charge vs. Time")
 soc_axis.set_xlabel("Time [h]")
 soc_axis.set_ylabel("SOC [%]")
+soc_axis.set_ylim(0, 105)
 
 # .flat turns the 2D Axes array into one sequence for the loop to visit.
 for axis in axes.flat:
-    axis.grid(True)
+    axis.minorticks_on()
+    axis.grid(True, which="major", linestyle="-", alpha=0.4)
+    axis.grid(True, which="minor", linestyle=":", alpha=0.2)
+    axis.legend(fontsize=8)
 
 # tight_layout() adjusts spacing so labels do not overlap. show() displays the
 # completed Figure in a window (or sends it to the active Matplotlib backend).
-figure.tight_layout()
+figure.tight_layout(rect=(0, 0, 1, 0.95))
 plt.show()
+
+# =========================================================
+# GRAPH EXPLANATIONS
+# =========================================================
+
+# TERMINAL VOLTAGE VS. TIME
+# What happens: The voltage stays nearly constant during the 10-minute rest,
+# drops quickly when the 1C discharge begins, and then decreases more gradually
+# until it reaches the 3.0 V minimum limit.
+# Why it happens: No load is applied during rest. Applying the discharge current
+# produces an immediate voltage drop from internal resistance and electrochemical
+# polarization. The later decline comes from lithium depletion and changing
+# electrode concentrations. Reaching 3.0 V ends the experiment to avoid excessive
+# discharge. The 4.2 V line shows the project maximum, but it is not a stop
+# condition during this discharge step.
+
+# CURRENT VS. TIME
+# What happens: Current begins at 0 A during the rest period and then steps up to
+# approximately 5 A, where it remains constant for the rest of the simulation.
+# Why it happens: The experiment explicitly requests a rest followed by a constant
+# 1C discharge. Chen2020 describes a 5 Ah cell, so a 1C rate corresponds to 5 A.
+# PyBaMM uses positive current for discharge, which is why the line is above zero.
+
+# CELL TEMPERATURE VS. TIME
+# What happens: Cell temperature stays near its 25 °C starting value during rest,
+# then rises during discharge while remaining below the 45 °C project limit.
+# Why it happens: Current flow creates irreversible resistive heat and reversible
+# electrochemical heat inside the cell. The lumped thermal model treats the cell
+# as one uniform temperature and includes heat loss to the surroundings, which
+# causes the rate of temperature increase to slow. The 0 °C and 45 °C lines are
+# visual project references; this experiment does not stop at those temperatures.
+
+# STATE OF CHARGE VS. TIME
+# What happens: SOC remains at 100% during rest and then decreases almost linearly,
+# crosses the 20% reference, and finishes near 5% when the voltage cutoff is met.
+# Why it happens: Rest removes no charge, while constant current removes charge at
+# an almost constant rate. Discharged capacity therefore rises almost linearly,
+# causing the calculated SOC to fall almost linearly. SOC does not need to reach
+# 0% because terminal voltage reaches the protective 3.0 V cutoff first. The 20%
+# line is a warning reference only and does not stop this simulation.
