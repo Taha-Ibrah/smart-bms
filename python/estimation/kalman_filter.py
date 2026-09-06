@@ -18,14 +18,16 @@ import numpy as np
 
 
 def estimate_soc_kalman_filter(
-    time_s,
-    measured_current_a,
-    measured_voltage_v,
-    nominal_capacity_ah,
+    time_s, #sensor data
+    measured_current_a, #sensor data
+    measured_voltage_v, #sensor data
+    nominal_capacity_ah, #battery specs
     initial_soc,
-    ocv_at_empty_v,
-    ocv_at_full_v,
-    internal_resistance_ohm=0.0,
+    ocv_at_empty_v, #battery specs
+    ocv_at_full_v, #battery specs
+    internal_resistance_ohm=0.0, #battery specs
+    #initial tuning values: The following values have not been calibrated yet
+    #variance is statistical measurement that tells you how spread out the numbers are in a data set from their mean value.
     process_variance_per_s=1e-8,
     measurement_variance_v2=0.05**2,
     initial_soc_variance=0.05**2,
@@ -102,48 +104,59 @@ def estimate_soc_kalman_filter(
     if not np.isfinite(initial_soc_variance) or initial_soc_variance < 0:
         raise ValueError("Initial SOC variance cannot be negative.")
 
+    # CREATE THE OUTPUT ARRAY THAT WILL STORE ONE SOC ESTIMATE PER SAMPLE.
     # Reserve one output position for every sensor sample.
     estimated_soc = np.empty(time_s.size, dtype=float)
 
+    # BUILD THE LINEAR OPEN-CIRCUIT-VOLTAGE MODEL USED BY THE FILTER.
     # The linear measurement model is OCV = intercept + slope * SOC.
     # At SOC = 0, the equation returns ocv_at_empty_v. At SOC = 1, it
     # returns ocv_at_full_v.
     ocv_intercept_v = ocv_at_empty_v
     ocv_slope_v_per_soc = ocv_at_full_v - ocv_at_empty_v
 
+    # INITIALIZE THE SOC STATE AND ITS STARTING UNCERTAINTY.
     # Begin with the supplied SOC estimate and our uncertainty about that value.
     soc_estimate = np.clip(initial_soc, 0.0, 1.0)
     soc_variance = initial_soc_variance
 
+    # PROCESS EACH SENSOR SAMPLE THROUGH THE PREDICTION AND CORRECTION STEPS.
     # Each loop iteration performs one prediction followed by one correction.
     for index in range(time_s.size):
         if index == 0:
+            # USE THE INITIAL STATE AS THE FIRST PREDICTION.
             # There is no earlier sample, so the first prediction is the initial SOC.
             predicted_soc = soc_estimate
             predicted_variance = soc_variance
         else:
+            # CALCULATE THE TIME ELAPSED SINCE THE PREVIOUS SENSOR SAMPLE.
             dt_s = time_s[index] - time_s[index - 1]
 
+            # CALCULATE THE AVERAGE CURRENT FLOWING DURING THIS TIME INTERVAL.
             # Average current improves integration across each sample interval.
             average_current_a = (
                 measured_current_a[index - 1] + measured_current_a[index]
             ) / 2.0
 
+            # CONVERT CURRENT OVER TIME INTO AMP-HOURS OF CHARGE REMOVED.
             # Current multiplied by time gives charge. Dividing by 3600 changes
             # amp-seconds into amp-hours so it matches nominal_capacity_ah.
             charge_removed_ah = average_current_a * dt_s / 3600.0
 
+            # PREDICT THE NEW SOC USING COULOMB COUNTING.
             # Prediction: advance SOC using the same sign convention as PyBaMM.
             predicted_soc = soc_estimate - (
                 charge_removed_ah / nominal_capacity_ah
             )
 
+            # INCREASE THE PREDICTION UNCERTAINTY ACCORDING TO ELAPSED TIME.
             # Q represents current-integration and model uncertainty. Scaling it
             # by dt means a longer interval creates more prediction uncertainty.
             predicted_variance = (
                 soc_variance + process_variance_per_s * dt_s
             )
 
+        # PREDICT TERMINAL VOLTAGE FROM THE PREDICTED SOC AND MEASURED CURRENT.
         # Measurement model:
         # terminal voltage = estimated OCV - current * internal resistance.
         # Positive discharge current lowers terminal voltage by the I * R drop.
@@ -153,6 +166,7 @@ def estimate_soc_kalman_filter(
             - measured_current_a[index] * internal_resistance_ohm
         )
 
+        # CALCULATE THE VOLTAGE RESIDUAL AND ITS TOTAL UNCERTAINTY.
         # Innovation, also called the residual, shows how far the measured voltage
         # is from the voltage predicted using the current SOC estimate.
         voltage_residual_v = measured_voltage_v[index] - predicted_voltage_v
@@ -161,6 +175,7 @@ def estimate_soc_kalman_filter(
             + measurement_variance_v2
         )
 
+        # CALCULATE HOW STRONGLY THE VOLTAGE MEASUREMENT SHOULD CORRECT SOC.
         # The denominator combines prediction uncertainty and measurement
         # uncertainty. A larger Kalman gain gives voltage more influence.
         kalman_gain = (
@@ -169,12 +184,14 @@ def estimate_soc_kalman_filter(
             / residual_variance_v2
         )
 
+        # CORRECT THE SOC PREDICTION AND STORE THE RESULT.
         # Correction: move the predicted SOC in the direction indicated by the
         # voltage residual. Clipping prevents an impossible reported SOC.
         soc_estimate = predicted_soc + kalman_gain * voltage_residual_v
         soc_estimate = np.clip(soc_estimate, 0.0, 1.0)
         estimated_soc[index] = soc_estimate
 
+        # UPDATE THE SOC UNCERTAINTY AFTER USING THE VOLTAGE MEASUREMENT.
         # After using a measurement, uncertainty normally decreases. This
         # Joseph-form scalar update helps keep the variance nonnegative despite
         # floating-point rounding.
@@ -184,5 +201,6 @@ def estimate_soc_kalman_filter(
             + kalman_gain**2 * measurement_variance_v2
         )
 
+    # RETURN THE COMPLETE TIME-ALIGNED SOC ESTIMATE.
     # Each returned SOC value corresponds to the input sample at the same index.
     return estimated_soc
