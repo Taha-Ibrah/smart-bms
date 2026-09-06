@@ -286,6 +286,8 @@ if __name__ == "__main__":
 # GRAPH EXPLANATIONS
 # =========================================================
 
+#QUICK REMINDER: 1C Discharge means the entire battery discharges in ~1 hour
+
 # TERMINAL VOLTAGE VS. TIME
 # What happens: The voltage stays nearly constant during the 10-minute rest,
 # drops quickly when the 1C discharge begins, and then decreases more gradually
