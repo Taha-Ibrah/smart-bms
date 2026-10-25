@@ -50,17 +50,13 @@ def estimate_soc_coulomb_counting(
         dt_s = time_s[index] - time_s[index - 1]
 
         # Average the current at both ends of the interval.
-        average_current_a = (
-            measured_current_a[index - 1] + measured_current_a[index]
-        ) / 2.0
+        average_current_a = (measured_current_a[index - 1] + measured_current_a[index]) / 2.0
 
         # Dividing by 3600 converts amp-seconds into amp-hours.
         charge_removed_ah = average_current_a * dt_s / 3600.0
 
         # Positive current represents discharge, so it lowers the estimated SOC.
-        estimated_soc[index] = estimated_soc[index - 1] - (
-            charge_removed_ah / nominal_capacity_ah
-        )
+        estimated_soc[index] = estimated_soc[index - 1] - (charge_removed_ah / nominal_capacity_ah)
 
         # Prevent numerical estimates outside the physical SOC range.
         estimated_soc[index] = np.clip(estimated_soc[index], 0.0, 1.0)

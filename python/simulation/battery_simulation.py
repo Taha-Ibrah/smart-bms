@@ -1,7 +1,15 @@
 """
-Purpose: Define the lithium-ion battery being simulated
-1.1: Select a battery and define its capacity and operating limilts
+Purpose: Approximate the EEMB LP103454 (3.7 V, 2000 mAh) battery.
+1.1: Select a battery and define its capacity and operating limits
 1.2: Use PyBaMM to simulate current, voltage, temperature and true SOC
+
+Ai2020 supplies LCO/graphite electrochemistry from an Enertech cell. It is a
+surrogate, not a measured parameter set for the EEMB cell. Electrode area is
+scaled to match nominal capacity; OCV, resistance, kinetics, and thermal
+properties still need validation against the purchased battery.
+
+Specification source (EEMB LP103454, 2019-04-29):
+https://datasheet.octopart.com/LP103454-EEMB-datasheet-182240587.pdf
 """
 import pybamm
 import matplotlib.pyplot as plt
@@ -18,12 +26,27 @@ def run_battery_simulation():
         }
     )
 
-    #Loads a complete set of physical battery parameters
-    #Chen2020 represents a commerical lithium-ion cell.
-    parameter_values = pybamm.ParameterValues("Chen2020")
+    battery_name = "EEMB LP103454"
+    parameter_set = "Ai2020"
+    parameter_values = pybamm.ParameterValues(parameter_set)
 
-    #Read the battery capacity from the selected parameter set.
-    nominal_capacity_ah = parameter_values["Nominal cell capacity [A.h]"]
+    # Published EEMB specs. Replace rated capacity with a measured value later.
+    nominal_capacity_ah = 2.0
+    minimum_capacity_ah = 1.9
+    nominal_voltage_v = 3.7
+    datasheet_minimum_voltage_v = 2.75
+    maximum_charge_current_a = 2.0
+    maximum_discharge_current_a = 4.0
+    charge_temp_range_c = (0.0, 45.0)
+    discharge_temp_range_c = (-20.0, 60.0)
+    cell_mass_kg = 0.040
+    # Approximate outer envelope, not the internal electrode dimensions.
+    length_m, width_m, thickness_m = 0.056, 0.0345, 0.0103
+
+    # Changing only the nominal-capacity label would leave the original
+    # 2.28 Ah electrode inventory in place. Scale its area by 2.0 / 2.28 too.
+    capacity_scale = nominal_capacity_ah / parameter_values["Nominal cell capacity [A.h]"]
+    scaled_electrode_width_m = parameter_values["Electrode width [m]"] * capacity_scale
 
     #Define opeating limits used by this project.
     #PROJECT-LEVEL LIMITS, separate from PyBaMM's internal parameters
@@ -34,15 +57,41 @@ def run_battery_simulation():
     minimum_temp_c = 0.0
     maximum_temp_c = 45.0
 
+    # Use the EEMB outer envelope for an approximate lumped thermal model.
+    # Specific heat, density, and heat transfer remain Ai2020 assumptions;
+    # the temperature trace is not a validated prediction for the real cell.
+    parameter_values.update({
+        "Nominal cell capacity [A.h]": nominal_capacity_ah,
+        "Electrode width [m]": scaled_electrode_width_m,
+        "Lower voltage cut-off [V]": minimum_voltage_v,
+        "Upper voltage cut-off [V]": maximum_voltage_v,
+        "Cell volume [m3]": length_m * width_m * thickness_m,
+        "Cell cooling surface area [m2]": 2.0 * (
+            length_m * width_m + length_m * thickness_m + width_m * thickness_m
+        ),
+        "Initial temperature [K]": 298.15,
+        "Ambient temperature [K]": 298.15,
+    })
+
     #Starting SOC for the simulation
     initial_soc = 1.0 #1.0 = 100%
 
+
+    # The published capacity is specified at 0.2C: 2.0 Ah * 0.2 = 0.4 A.
+    # This is a simulated load, not the breadboard voltage-divider circuit.
+    discharge_c_rate = 0.2
+    discharge_current_a = nominal_capacity_ah * discharge_c_rate
+    # The borrowed electrochemistry can deliver a different usable capacity.
+    # Stop after removing the nominal 2 Ah as well as checking the voltage,
+    # so the nominal-capacity SOC reference never silently runs below zero.
+    discharge_duration_h = nominal_capacity_ah / discharge_current_a
 
     #Define what is happening in the battery.
     experiment = pybamm.Experiment(
         [
             "Rest for 10 minutes",
-            f"Discharge at 1C until {minimum_voltage_v} V"
+            f"Discharge at {discharge_current_a} A for {discharge_duration_h} hours "
+            f"or until {minimum_voltage_v} V"
         ],
         period ="10 seconds"
     )
@@ -82,9 +131,24 @@ def run_battery_simulation():
 
     # Later pipeline stages can consume these values without opening plots.
     return {
+        "battery_name": battery_name,
         "model_name": model.name,
-        "parameter_set": "Chen2020",
+        "parameter_set": parameter_set,
+        "model_is_approximation": True,
+        "capacity_scale": capacity_scale,
         "nominal_capacity_ah": nominal_capacity_ah,
+        "minimum_capacity_ah": minimum_capacity_ah,
+        "nominal_voltage_v": nominal_voltage_v,
+        "datasheet_minimum_voltage_v": datasheet_minimum_voltage_v,
+        "maximum_charge_current_a": maximum_charge_current_a,
+        "maximum_discharge_current_a": maximum_discharge_current_a,
+        "charge_temp_range_c": charge_temp_range_c,
+        "discharge_temp_range_c": discharge_temp_range_c,
+        "cell_mass_kg": cell_mass_kg,
+        "cell_dimensions_m": (length_m, width_m, thickness_m),
+        "discharge_c_rate": discharge_c_rate,
+        "discharge_current_a": discharge_current_a,
+        "discharge_duration_h": discharge_duration_h,
         "minimum_voltage_v": minimum_voltage_v,
         "maximum_voltage_v": maximum_voltage_v,
         "minimum_temp_c": minimum_temp_c,
@@ -120,15 +184,23 @@ def show_simulation_results(results):
     # ============================================
     print("\nBattery configuration")
     print("---------------------")
+    print(f"Target battery: {results['battery_name']}")
     print(f"Model: {model_name}")
-    print(f"Parameter set: {parameter_set}")
+    print(f"Parameter set: {parameter_set} (scaled surrogate; not hardware-calibrated)")
+    print(f"Nominal voltage: {results['nominal_voltage_v']:.1f} V")
     print(f"Nominal capacity: {nominal_capacity_ah:.2f} Ah")
     print(
-        f"Voltage limits: "
+        f"Simulated discharge: {results['discharge_c_rate']:g}C "
+        f"({results['discharge_current_a']:.2f} A)"
+    )
+    print(f"Datasheet discharge cutoff: {results['datasheet_minimum_voltage_v']:.2f} V")
+    print(f"Maximum discharge duration: {results['discharge_duration_h']:g} hours")
+    print(
+        f"Project voltage limits: "
         f"{minimum_voltage_v:.2f} V to {maximum_voltage_v:.2f} V"
     )
     print(
-        f"Temperature limits: "
+        f"Project temperature references (not enforced): "
         f"{minimum_temp_c:.1f} °C to "
         f"{maximum_temp_c:.1f} °C"
     )
@@ -166,7 +238,8 @@ def show_simulation_results(results):
 
     # suptitle() adds one heading for the complete figure, above the subplot titles.
     figure.suptitle(
-        "PyBaMM Battery Simulation: 10 Minute Rest Followed by 1C Discharge",
+        f"{results['battery_name']} Approximation: 10 Minute Rest, "
+        f"{results['discharge_c_rate']:g}C Discharge",
         fontsize=16,
         fontweight="bold",
     )
@@ -252,7 +325,7 @@ def show_simulation_results(results):
         linewidth=2,
         marker="o",
         markevery=[0, -1],
-        label="Calculated SOC",
+        label="Simulated SOC reference",
     )
     soc_axis.axhline(
         20,
@@ -286,29 +359,30 @@ if __name__ == "__main__":
 # GRAPH EXPLANATIONS
 # =========================================================
 
-#QUICK REMINDER: 1C Discharge means the entire battery discharges in ~1 hour
+# QUICK REMINDER: 0.2C for the 2 Ah target cell is 0.4 A. Ideally, discharging
+# the full rated capacity at that current would take 5 hours, excluding rest.
 
 # TERMINAL VOLTAGE VS. TIME
 # What happens: The voltage stays nearly constant during the 10-minute rest,
-# drops quickly when the 1C discharge begins, and then decreases more gradually
-# until it reaches the 3.0 V minimum limit.
+# drops when the 0.2C discharge begins, and then decreases more gradually
+# until it reaches the 3.0 V minimum limit or the 5-hour discharge ends.
 # Why it happens: No load is applied during rest. Applying the discharge current
 # produces an immediate voltage drop from internal resistance and electrochemical
 # polarization. The later decline comes from lithium depletion and changing
-# electrode concentrations. Reaching 3.0 V ends the experiment to avoid excessive
-# discharge. The 4.2 V line shows the project maximum, but it is not a stop
+# electrode concentrations. Reaching 3.0 V or removing the rated 2 Ah ends the
+# experiment. The 4.2 V line shows the project maximum, but it is not a stop
 # condition during this discharge step.
 
 # CURRENT VS. TIME
 # What happens: Current begins at 0 A during the rest period and then steps up to
-# approximately 5 A, where it remains constant for the rest of the simulation.
+# 0.4 A, where it remains constant for the rest of the simulation.
 # Why it happens: The experiment explicitly requests a rest followed by a constant
-# 1C discharge. Chen2020 describes a 5 Ah cell, so a 1C rate corresponds to 5 A.
+# 0.2C discharge. The 2 Ah target capacity gives 2 * 0.2 = 0.4 A.
 # PyBaMM uses positive current for discharge, which is why the line is above zero.
 
 # CELL TEMPERATURE VS. TIME
 # What happens: Cell temperature stays near its 25 °C starting value during rest,
-# then rises during discharge while remaining below the 45 °C project limit.
+# then changes during discharge. Its magnitude is an uncalibrated approximation.
 # Why it happens: Current flow creates irreversible resistive heat and reversible
 # electrochemical heat inside the cell. The lumped thermal model treats the cell
 # as one uniform temperature and includes heat loss to the surroundings, which
@@ -317,9 +391,9 @@ if __name__ == "__main__":
 
 # STATE OF CHARGE VS. TIME
 # What happens: SOC remains at 100% during rest and then decreases almost linearly,
-# crosses the 20% reference, and finishes near 5% when the voltage cutoff is met.
+# until the voltage cutoff or nominal-capacity limit is met.
 # Why it happens: Rest removes no charge, while constant current removes charge at
 # an almost constant rate. Discharged capacity therefore rises almost linearly,
-# causing the calculated SOC to fall almost linearly. SOC does not need to reach
-# 0% because terminal voltage reaches the protective 3.0 V cutoff first. The 20%
-# line is a warning reference only and does not stop this simulation.
+# causing the calculated SOC to fall almost linearly. The voltage cutoff can
+# stop the experiment before nominal-capacity SOC reaches 0%. The 20% line is a
+# warning reference only and does not stop this simulation.
