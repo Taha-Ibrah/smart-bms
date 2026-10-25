@@ -12,8 +12,9 @@ protection control have not been implemented.
 ## Current focus
 
 Clarify the model and build the estimator comparison one step at a time.
-**The immediate next task is to obtain an OCV–SOC curve and fit the resistance
-and RC parameters needed by the filters.** OCV means open-circuit voltage: the
+The OCV–SOC experiment is implemented. **The immediate next task is to use its
+points to build the KF's linear OCV model and the EKF's nonlinear lookup, then
+fit resistance and RC parameters.** OCV means open-circuit voltage: the
 battery voltage after resting without a load.
 
 The three estimator implementations exist, but there is no complete comparison
@@ -37,7 +38,7 @@ Full specifications, sources, and assumptions are in [battery_specs.md](battery_
 | Initial cell and ambient temperature | 25 °C |
 | Initial SOC | 100%, assumed for simulation |
 | Experiment | Rest for 10 minutes, then discharge at 0.2C = 0.4 A |
-| Discharge stopping condition | Five hours of discharge or 3.0 V, whichever comes first |
+| Capacity-test stopping condition | Reach 3.0 V; reject the test if the 10-hour time guard ends it first |
 | Project voltage limits | 3.0–4.2 V |
 | Temperature plot references | 0–45 °C; these do not trigger a shutdown |
 | Output interval | 10 seconds, with additional step-boundary points possible |
@@ -48,10 +49,17 @@ set. The OCV curve, resistance, transport properties, and thermal behavior still
 need validation against the purchased battery. Its outer dimensions are used
 for an approximate thermal envelope; other thermal properties remain borrowed.
 
-The simulation calculates its SOC reference from discharged charge divided by
-the nominal capacity. The five-hour limit prevents removal of more than 2 Ah in
-this experiment. Reaching 0% on that reference does not establish that the real
-battery is exhausted, and the run can end above 3.0 V.
+The simulation first measures usable capacity by discharging the model at
+0.4 A to 3.0 V. It calculates SOC as `1 - discharged_Ah / usable_capacity_Ah`.
+The current surrogate delivers approximately **2.153 Ah** in that reference
+test. Its advertised target rating remains **2.0 Ah**; these are separate values.
+Both the discharge simulation and the OCV experiment use the same capacity
+reference. When replaying simulated data through the estimators, pass
+`usable_capacity_ah` as their capacity argument. This reference-test measurement
+defines an SOC scale; it does not calibrate the battery chemistry or establish
+the purchased battery's capacity. Using `1 - discharged_Ah / 2.0` would instead
+express nominal-capacity SOC. That is another valid convention, with a different
+meaning for its 0% point.
 
 ## What exists today
 
@@ -59,13 +67,14 @@ battery is exhausted, and the run can end above 3.0 V.
 | --- | --- | --- |
 | Battery simulation and plots | [battery_simulation.py](python/simulation/battery_simulation.py) | Implemented; EEMB approximation needs calibration |
 | Repeatable sensor noise and bias | [sensor_noise.py](python/simulation/sensor_noise.py) | Implemented; noise settings are initial assumptions |
+| Rested OCV–SOC experiment | [ocv_soc.py](python/simulation/ocv_soc.py) | Implemented; reports settling checks and returns points for later filter models |
 | Coulomb counting | [coulomb_counter.py](python/estimation/coulomb_counter.py) | Implemented |
 | Linear, one-state KF | [kalman_filter.py](python/estimation/kalman_filter.py) | Implemented; requires a linear OCV approximation and resistance |
 | Two-state EKF: SOC and polarization voltage | [ekf.py](python/estimation/ekf.py) | Implemented; requires nonlinear OCV and R0, R1, C1 |
 | Estimation notes | [soc_estimation.pdf](python/estimation/soc_estimation.pdf) | Reference document |
 | Arduino sensors, calibration, and serial protocol | [arduino_firmware/](arduino_firmware/) | Empty placeholders |
 | Shared comparison plots and dashboard | [python/visualization/](python/visualization/) | Empty placeholders; simulation plots already work |
-| Automated tests | [python/tests/](python/tests/) | Empty placeholders |
+| Automated tests | [python/tests/](python/tests/) | Simulation/OCV regression checks implemented; estimator and database test files remain placeholders |
 | Database and Docker setup | [python/database/](python/database/), [docker/](docker/) | Empty placeholders; optional supporting work |
 
 The filters do not receive the simulated SOC reference as an input. It is
@@ -93,6 +102,35 @@ Run the simulation with repeatable sensor noise and print the measurement errors
 
 ```bash
 python python/simulation/sensor_noise.py
+```
+
+Generate a rested-voltage table and plot its OCV–SOC approximation:
+
+```bash
+python python/simulation/ocv_soc.py
+```
+
+This experiment first runs the continuous-discharge capacity test. By default
+it then removes 2% of that reference capacity at 0.4 A between one-hour rests,
+producing 51 points unless the voltage cutoff is reached first. For the current
+model, each discharge step is approximately 6.46 minutes. The finer sampling
+resolves Ai2020's low-SOC knee; it does not change the model's voltage equations.
+Pass `soc_step=0.1` to reproduce the earlier 10% grid for comparison.
+It checks voltage drift over the final 10 minutes of each rest and flags points
+that exceed 1 mV. `generate_ocv_soc_curve()` returns `soc_points` and
+`ocv_points_v` in increasing SOC order, together with settling diagnostics.
+The SOC axis uses the same usable-capacity reference as the discharge script.
+Its 0% point represents capacity removed to cutoff in the reference test;
+the subsequently rested voltage can recover above 3.0 V. Usable capacity
+depends on current, cutoff, temperature, and rest history, so this curve does
+not establish the real battery's SOC mapping.
+The existing discharge simulation and this experiment share
+`create_battery_configuration()` in `battery_simulation.py`.
+
+Run the focused simulation and OCV regression tests:
+
+```bash
+python -m unittest python.tests.test_simulation -v
 ```
 
 These commands run simulations only. They do not connect to an Arduino, charge

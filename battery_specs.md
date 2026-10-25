@@ -36,12 +36,26 @@ heat, and cooling assumptions otherwise come from Ai2020. The listed 40 g mass
 is metadata; it is not a fitted thermal mass. Voltage and temperature predictions
 need validation against the purchased cell.
 
-The experiment rests for 10 minutes, then discharges at **0.2C = 0.4 A** for at
-most **5 hours**, or until **3.0 V**, whichever comes first. The time limit caps
-removed charge at the rated 2 Ah: the borrowed electrochemistry can otherwise
-deliver more than the nominal capacity and make the nominal-capacity SOC
-reference negative. The final voltage need not equal 3.0 V, and reaching 0%
-nominal-capacity SOC does not establish that the real battery is exhausted.
+The reference capacity test rests for 10 minutes, then discharges at
+**0.2C of the nominal rating = 0.4 A** until **3.0 V**. A 10-hour solver time
+guard rejects an incomplete test instead of labeling its endpoint empty.
+The model supplies approximately **2.153 Ah** in this test; the advertised
+hardware rating remains **2.0 Ah**. `usable_capacity_ah` records the simulated
+measurement separately from `nominal_capacity_ah`.
+
+Both the discharge simulation and `ocv_soc.py` define SOC using
+`1 - removed_Ah / usable_capacity_Ah`. This is a reference-test convention, not
+a correction to the model's chemistry. Normalizing to the advertised 2 Ah
+would instead give nominal-capacity SOC; that convention is also valid when
+clearly labeled, though its endpoint need not be the model's cutoff state.
+The OCV experiment removes 2% of the reference capacity per step and rests for
+one hour before recording voltage. This finer grid resolves the steep low-SOC
+knee without changing the model's predicted voltages at the original points.
+The rested 0% voltage can recover above the loaded 3.0 V cutoff. This capacity
+reference is conditional on the current, temperature, and discharge protocol;
+rest periods can change how much charge can subsequently be delivered.
+It does not establish the real battery's usable capacity or OCV curve.
+
 The project cutoff is above the published 2.75 V limit. The model's lower
 and upper voltage cutoffs are explicitly set to 3.0 V and 4.2 V. The 0–45 °C
 lines on the temperature plot are project references, not enforced stop events.

@@ -16,8 +16,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def run_battery_simulation():
-    """Run the battery model and return its measurements and metadata."""
+def create_battery_configuration():
+    """Return a fresh model, parameters, and shared battery specifications.
+
+    The normal discharge simulation and the OCV experiment both call this
+    function so their chemistry, capacity, geometry, and limits stay aligned.
+    """
     #SPM = Single Particle Model
     #Simplified Lithium-ion battery that runs quickly, captures important battery behavior, commonly used
     model = pybamm.lithium_ion.SPM(
@@ -73,6 +77,42 @@ def run_battery_simulation():
         "Ambient temperature [K]": 298.15,
     })
 
+    battery_specs = {
+        "battery_name": battery_name,
+        "model_name": model.name,
+        "parameter_set": parameter_set,
+        "model_is_approximation": True,
+        "capacity_scale": capacity_scale,
+        "nominal_capacity_ah": nominal_capacity_ah,
+        "minimum_capacity_ah": minimum_capacity_ah,
+        "nominal_voltage_v": nominal_voltage_v,
+        "datasheet_minimum_voltage_v": datasheet_minimum_voltage_v,
+        "maximum_charge_current_a": maximum_charge_current_a,
+        "maximum_discharge_current_a": maximum_discharge_current_a,
+        "charge_temp_range_c": charge_temp_range_c,
+        "discharge_temp_range_c": discharge_temp_range_c,
+        "cell_mass_kg": cell_mass_kg,
+        "cell_dimensions_m": (length_m, width_m, thickness_m),
+        "minimum_voltage_v": minimum_voltage_v,
+        "maximum_voltage_v": maximum_voltage_v,
+        "minimum_temp_c": minimum_temp_c,
+        "maximum_temp_c": maximum_temp_c,
+    }
+    return model, parameter_values, battery_specs
+
+
+def run_battery_simulation():
+    """Discharge to the project cutoff and measure the model's usable capacity.
+
+    The resulting capacity defines a reference-test SOC convention. Normalizing
+    to the advertised capacity would be another convention, not invalid math.
+    This reference test does not fit the model's chemistry to the real EEMB.
+    The advertised nominal capacity remains separate in the returned metadata.
+    """
+    model, parameter_values, battery_specs = create_battery_configuration()
+    nominal_capacity_ah = battery_specs["nominal_capacity_ah"]
+    minimum_voltage_v = battery_specs["minimum_voltage_v"]
+
     #Starting SOC for the simulation
     initial_soc = 1.0 #1.0 = 100%
 
@@ -81,10 +121,10 @@ def run_battery_simulation():
     # This is a simulated load, not the breadboard voltage-divider circuit.
     discharge_c_rate = 0.2
     discharge_current_a = nominal_capacity_ah * discharge_c_rate
-    # The borrowed electrochemistry can deliver a different usable capacity.
-    # Stop after removing the nominal 2 Ah as well as checking the voltage,
-    # so the nominal-capacity SOC reference never silently runs below zero.
-    discharge_duration_h = nominal_capacity_ah / discharge_current_a
+    # Allow twice the nominal discharge time as a solver time guard. A valid
+    # capacity test must actually reach the voltage cutoff; the time guard must
+    # never be mistaken for an empty battery or a completed capacity measurement.
+    discharge_duration_h = 2.0 * nominal_capacity_ah / discharge_current_a
 
     #Define what is happening in the battery.
     experiment = pybamm.Experiment(
@@ -106,6 +146,17 @@ def run_battery_simulation():
     #Run the simulation
     solution = simulation.solve(initial_soc=initial_soc)
 
+    final_voltage_v = float(solution["Terminal voltage [V]"].entries[-1])
+    discharge_step = solution.cycles[-1].steps[-1]
+    if (
+        discharge_step.termination == "final time"
+        or not np.isclose(final_voltage_v, minimum_voltage_v, rtol=0, atol=1e-4)
+    ):
+        raise RuntimeError(
+            "The capacity test did not reach the project voltage cutoff. "
+            "Do not use a time-limited discharge to define 0% SOC."
+        )
+
     #Each .entries property is NumPy array containing the value
     # of that variable at every simulation time point.
     time_s = solution["Time [s]"].entries
@@ -120,45 +171,39 @@ def run_battery_simulation():
     #convert temperature from Kelvin to Celsius
     temperature_c = temperature_k - 273.15
 
-    #Calculate true SOC from the simulated discharged capacity
+    # The last capacity value measures charge delivered from full to cutoff.
+    # Ai2020 is a surrogate, so this may differ from the EEMB's advertised 2 Ah.
+    usable_capacity_ah = float(discharge_capacity_ah[-1])
+    if not np.isfinite(usable_capacity_ah) or usable_capacity_ah <= 0:
+        raise RuntimeError("The simulated usable capacity must be positive and finite.")
 
-    #Starting SOC is 100%, so:
-    #SOC = 1 - discharged charge / nominal capacity
-    true_soc = initial_soc - (discharge_capacity_ah / nominal_capacity_ah)
+    # Define the simulated SOC reference using measured model capacity:
+    # SOC = 1 - discharged charge / usable capacity.
+    # Use this same capacity in the OCV experiment and later estimator replay.
+    true_soc = initial_soc - (discharge_capacity_ah / usable_capacity_ah)
     #Keep numerical results within the valid SOC range
     true_soc = np.clip(true_soc, 0.0,1.0)
     true_soc_percent = true_soc * 100.0
 
     # Later pipeline stages can consume these values without opening plots.
     return {
-        "battery_name": battery_name,
-        "model_name": model.name,
-        "parameter_set": parameter_set,
-        "model_is_approximation": True,
-        "capacity_scale": capacity_scale,
-        "nominal_capacity_ah": nominal_capacity_ah,
-        "minimum_capacity_ah": minimum_capacity_ah,
-        "nominal_voltage_v": nominal_voltage_v,
-        "datasheet_minimum_voltage_v": datasheet_minimum_voltage_v,
-        "maximum_charge_current_a": maximum_charge_current_a,
-        "maximum_discharge_current_a": maximum_discharge_current_a,
-        "charge_temp_range_c": charge_temp_range_c,
-        "discharge_temp_range_c": discharge_temp_range_c,
-        "cell_mass_kg": cell_mass_kg,
-        "cell_dimensions_m": (length_m, width_m, thickness_m),
+        **battery_specs,
+        "usable_capacity_ah": usable_capacity_ah,
+        "soc_reference": (
+            f"continuous discharge at {discharge_current_a:g} A to "
+            f"{minimum_voltage_v:g} V, "
+            f"{parameter_values['Ambient temperature [K]'] - 273.15:g} deg C ambient"
+        ),
         "discharge_c_rate": discharge_c_rate,
         "discharge_current_a": discharge_current_a,
         "discharge_duration_h": discharge_duration_h,
-        "minimum_voltage_v": minimum_voltage_v,
-        "maximum_voltage_v": maximum_voltage_v,
-        "minimum_temp_c": minimum_temp_c,
-        "maximum_temp_c": maximum_temp_c,
         "initial_soc": initial_soc,
         "time_s": time_s,
         "time_h": time_h,
         "current_a": current_a,
         "voltage_v": voltage_v,
         "temperature_c": temperature_c,
+        "discharge_capacity_ah": discharge_capacity_ah,
         "true_soc": true_soc,
         "true_soc_percent": true_soc_percent,
     }
@@ -189,12 +234,13 @@ def show_simulation_results(results):
     print(f"Parameter set: {parameter_set} (scaled surrogate; not hardware-calibrated)")
     print(f"Nominal voltage: {results['nominal_voltage_v']:.1f} V")
     print(f"Nominal capacity: {nominal_capacity_ah:.2f} Ah")
+    print(f"Reference-test capacity / SOC scale: {results['usable_capacity_ah']:.4f} Ah")
     print(
         f"Simulated discharge: {results['discharge_c_rate']:g}C "
         f"({results['discharge_current_a']:.2f} A)"
     )
     print(f"Datasheet discharge cutoff: {results['datasheet_minimum_voltage_v']:.2f} V")
-    print(f"Maximum discharge duration: {results['discharge_duration_h']:g} hours")
+    print(f"Capacity-test time guard: {results['discharge_duration_h']:g} hours")
     print(
         f"Project voltage limits: "
         f"{minimum_voltage_v:.2f} V to {maximum_voltage_v:.2f} V"
@@ -361,16 +407,17 @@ if __name__ == "__main__":
 
 # QUICK REMINDER: 0.2C for the 2 Ah target cell is 0.4 A. Ideally, discharging
 # the full rated capacity at that current would take 5 hours, excluding rest.
+# The surrogate's measured usable capacity can differ from that rated value.
 
 # TERMINAL VOLTAGE VS. TIME
 # What happens: The voltage stays nearly constant during the 10-minute rest,
 # drops when the 0.2C discharge begins, and then decreases more gradually
-# until it reaches the 3.0 V minimum limit or the 5-hour discharge ends.
+# until it reaches the 3.0 V minimum limit.
 # Why it happens: No load is applied during rest. Applying the discharge current
 # produces an immediate voltage drop from internal resistance and electrochemical
 # polarization. The later decline comes from lithium depletion and changing
-# electrode concentrations. Reaching 3.0 V or removing the rated 2 Ah ends the
-# experiment. The 4.2 V line shows the project maximum, but it is not a stop
+# electrode concentrations. Reaching 3.0 V ends the capacity test. If the time
+# guard is reached first, the run is rejected. The 4.2 V line is not a stop
 # condition during this discharge step.
 
 # CURRENT VS. TIME
@@ -391,9 +438,9 @@ if __name__ == "__main__":
 
 # STATE OF CHARGE VS. TIME
 # What happens: SOC remains at 100% during rest and then decreases almost linearly,
-# until the voltage cutoff or nominal-capacity limit is met.
+# until it reaches 0% at the capacity-test voltage cutoff.
 # Why it happens: Rest removes no charge, while constant current removes charge at
 # an almost constant rate. Discharged capacity therefore rises almost linearly,
-# causing the calculated SOC to fall almost linearly. The voltage cutoff can
-# stop the experiment before nominal-capacity SOC reaches 0%. The 20% line is a
-# warning reference only and does not stop this simulation.
+# causing the calculated SOC to fall almost linearly. The final discharged Ah
+# defines the usable capacity for this current, cutoff, and temperature. The
+# 20% line is a warning reference only and does not stop this simulation.
