@@ -12,9 +12,10 @@ protection control have not been implemented.
 ## Current focus
 
 Clarify the model and build the estimator comparison one step at a time.
-The OCV–SOC experiment is implemented. **The immediate next task is to use its
-points to build the KF's linear OCV model and the EKF's nonlinear lookup, then
-fit resistance and RC parameters.** OCV means open-circuit voltage: the
+The OCV–SOC experiment now supplies a fitted linear model for the KF and a
+nonlinear lookup with its derivative for the EKF. A simulated pulse test now
+generates current-switch and voltage-recovery data. **The immediate next task is
+to fit R0, R1, and C1 from that response.** OCV means open-circuit voltage: the
 battery voltage after resting without a load.
 
 The three estimator implementations exist, but there is no complete comparison
@@ -67,10 +68,11 @@ meaning for its 0% point.
 | --- | --- | --- |
 | Battery simulation and plots | [battery_simulation.py](python/simulation/battery_simulation.py) | Implemented; EEMB approximation needs calibration |
 | Repeatable sensor noise and bias | [sensor_noise.py](python/simulation/sensor_noise.py) | Implemented; noise settings are initial assumptions |
-| Rested OCV–SOC experiment | [ocv_soc.py](python/simulation/ocv_soc.py) | Implemented; reports settling checks and returns points for later filter models |
+| Rested OCV–SOC experiment | [ocv_soc.py](python/simulation/ocv_soc.py) | Implemented; settling checks, KF least-squares line, and EKF lookup/derivative |
+| Simulated pulse response | [pulse_test.py](python/simulation/pulse_test.py) | Implemented; rest/pulse/recovery data and plots, parameter fitting pending |
 | Coulomb counting | [coulomb_counter.py](python/estimation/coulomb_counter.py) | Implemented |
-| Linear, one-state KF | [kalman_filter.py](python/estimation/kalman_filter.py) | Implemented; requires a linear OCV approximation and resistance |
-| Two-state EKF: SOC and polarization voltage | [ekf.py](python/estimation/ekf.py) | Implemented; requires nonlinear OCV and R0, R1, C1 |
+| Linear, one-state KF | [kalman_filter.py](python/estimation/kalman_filter.py) | Implemented; fitted OCV line available, resistance identification pending |
+| Two-state EKF: SOC and polarization voltage | [ekf.py](python/estimation/ekf.py) | Implemented; OCV lookup/derivative available, R0/R1/C1 identification pending |
 | Estimation notes | [soc_estimation.pdf](python/estimation/soc_estimation.pdf) | Reference document |
 | Arduino sensors, calibration, and serial protocol | [arduino_firmware/](arduino_firmware/) | Empty placeholders |
 | Shared comparison plots and dashboard | [python/visualization/](python/visualization/) | Empty placeholders; simulation plots already work |
@@ -127,7 +129,82 @@ not establish the real battery's SOC mapping.
 The existing discharge simulation and this experiment share
 `create_battery_configuration()` in `battery_simulation.py`.
 
-Run the focused simulation and OCV regression tests:
+The plot overlays the KF's least-squares line and the EKF's nonlinear lookup on
+the rested samples, and the terminal reports the line's voltage RMSE and maximum
+error. The straight line can have substantial error near the low-SOC knee.
+These are OCV fit errors, not SOC estimator accuracy results.
+
+Build the inputs for the existing filters in Python:
+
+```python
+from python.simulation.ocv_soc import (
+    generate_ocv_soc_curve,
+    fit_linear_ocv_model,
+    build_nonlinear_ocv_model,
+)
+
+curve = generate_ocv_soc_curve()
+if not curve["settled_points"].all():
+    raise ValueError("Increase the rest duration before building filter models.")
+linear = fit_linear_ocv_model(curve["soc_points"], curve["ocv_points_v"])
+ocv_function, ocv_derivative_function = build_nonlinear_ocv_model(
+    curve["soc_points"], curve["ocv_points_v"]
+)
+```
+
+Pass `linear["ocv_at_empty_v"]` and `linear["ocv_at_full_v"]` to the KF's
+arguments of the same names. These values are the fitted line at SOC 0 and 1,
+so they can differ from the original rested endpoint voltages. The returned
+dictionary also includes `ocv_intercept_v`, `ocv_slope_v_per_soc`, `rmse_v`, and
+`max_error_v`. Pass the two nonlinear callables to the EKF's `ocv_function` and
+`ocv_derivative_function` arguments.
+
+The nonlinear model uses
+[SciPy PCHIP interpolation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.PchipInterpolator.html)
+to follow the sampled curve and obtains its derivative from the same interpolant.
+Both helpers require finite, ordered samples covering SOC 0 to 1. They cannot
+build a full-range filter model from an experiment stopped at a partial SOC.
+Lookup queries must also be fractions from 0 to 1; the derivative is in volts
+per unit SOC, not per percentage point. No extrapolation is performed.
+The caller must check settling before fitting; the plot shows only raw samples
+if settling or full-range coverage fails.
+
+Use `curve["usable_capacity_ah"]` for both filters' `nominal_capacity_ah` argument
+to keep the SOC reference consistent. The KF still needs series resistance and
+the EKF needs R0, R1, and C1 before a meaningful loaded-cell comparison.
+
+Generate a simulated current pulse and voltage-recovery plot:
+
+```bash
+python python/simulation/pulse_test.py
+```
+
+`run_pulse_test()` conditions the battery from full to **50% reference SOC**,
+rests for **one hour**, discharges at **0.4 A for 60 seconds**, and rests for
+**30 minutes**. It reuses the existing model and usable-capacity reference.
+The pulse removes about 0.00667 Ah, bringing SOC to approximately 49.690%.
+The first discharge is preparation; the returned arrays start at the pre-pulse
+rest, while cumulative discharged Ah still includes that preparation.
+
+The left plots show current and voltage through the full recovery, displaying
+only the last minute of the initial rest. The right plots show a closer view of
+the pulse. Plot time zero is load-on; returned `time_s` starts at the beginning
+of the full pre-pulse rest. Shading marks the load interval. Voltage jumps at
+current switching and slower relaxation provide data for later effective
+R0/R1/C1 fitting. The final rested voltage can differ from the initial voltage
+because the pulse removed charge.
+
+The function returns clean `time_s`, `current_a`, `voltage_v`, `temperature_c`,
+`discharge_capacity_ah`, and `true_soc` arrays, together with the capacity
+reference, per-sample `phase`, and switch indices/times. Both sides of each
+switch are preserved; do not round or resample them away before identifying
+the immediate voltage jump. Incomplete conditioning or a cutoff-truncated
+pulse raises an error. The module generates data only; R0/R1/C1 fitting and
+the estimator comparison remain to be implemented. Future fitted values will
+describe this surrogate under the selected conditions and still need hardware
+validation.
+
+Run the focused simulation, OCV-model, and pulse regression tests:
 
 ```bash
 python -m unittest python.tests.test_simulation -v
@@ -138,8 +215,8 @@ a battery, or control a physical load.
 
 ## Roadmap
 
-1. **Prepare the filter model.** Generate a rested OCV–SOC curve from the
-   simulation and fit a 1-RC equivalent circuit using pulse-response data.
+1. **Prepare the filter model.** The rested OCV–SOC curve and filter OCV inputs
+   are implemented. Next fit a 1-RC equivalent circuit using pulse-response data.
    Obtain R0 for the immediate voltage drop and R1/C1 for voltage relaxation.
    Keep identification data separate from evaluation data.
 2. **Compare all three estimators.** Replay the same noisy measurements through

@@ -7,6 +7,8 @@ cutoff. That test defines the SOC axis used here. This is an explicit reference
 convention; using the nominal rating would be a different convention, not an
 invalid calculation. Neither convention calibrates the model to the EEMB cell.
 The result is a simulated OCV approximation from the borrowed Ai2020 chemistry.
+The helpers below turn settled points into a fitted KF line and an EKF voltage
+lookup with its derivative. Both use SOC fractions from 0 to 1, not percentages.
 R0, R1, and C1 identification will be a separate step after this curve exists.
 """
 
@@ -15,6 +17,7 @@ import warnings
 import matplotlib.pyplot as plt
 import numpy as np
 import pybamm
+from scipy.interpolate import PchipInterpolator
 
 # Support both package imports and running this file directly from the terminal.
 if __package__:
@@ -195,8 +198,92 @@ def generate_ocv_soc_curve(
     }
 
 
+def _validate_ocv_points(soc_points, ocv_points_v):
+    """Check that paired samples cover the full SOC range needed by the filters."""
+    soc = np.array(soc_points, dtype=float, copy=True)
+    voltage = np.asarray(ocv_points_v, dtype=float)
+    if soc.ndim != 1 or voltage.ndim != 1 or soc.shape != voltage.shape:
+        raise ValueError("SOC and OCV must be matching one-dimensional arrays.")
+    if soc.size < 2 or not (np.isfinite(soc).all() and np.isfinite(voltage).all()):
+        raise ValueError("At least two finite SOC/OCV pairs are required.")
+
+    # The EKF checks OCV at both 0 and 1. An incomplete experiment cannot supply
+    # those endpoints without inventing voltages outside the sampled range.
+    if not (
+        np.isclose(soc[0], 0.0, rtol=0, atol=1e-10)
+        and np.isclose(soc[-1], 1.0, rtol=0, atol=1e-10)
+    ):
+        raise ValueError("OCV samples must cover the full SOC range from 0 to 1.")
+    # Remove only endpoint roundoff from charge integration, not a missing range.
+    soc[0], soc[-1] = 0.0, 1.0
+    if np.any(np.diff(soc) <= 0):
+        raise ValueError("SOC samples must be strictly increasing with no duplicates.")
+    return soc, voltage
+
+
+def fit_linear_ocv_model(soc_points, ocv_points_v):
+    """Fit a straight OCV line for the existing one-state KF.
+
+    Supply settled voltage samples covering SOC 0 to 1. Least squares gives
+    every sample equal weight and minimizes the sum of squared voltage errors.
+    The returned dictionary contains the intercept, slope, fitted endpoints,
+    and voltage RMSE/maximum absolute error at the supplied samples.
+
+    Pass ocv_at_empty_v and ocv_at_full_v to estimate_soc_kalman_filter(). These
+    are endpoints of the fitted line, not the measured minimum/maximum voltage.
+    The slope is in volts per unit SOC; SOC here is a fraction, not a percentage.
+    """
+    soc, voltage = _validate_ocv_points(soc_points, ocv_points_v)
+    slope, intercept = np.polyfit(soc, voltage, deg=1)
+    if np.ptp(voltage) == 0 or slope <= 0:
+        raise ValueError("The fitted OCV slope must be positive for this KF.")
+
+    # OCV = intercept + slope * SOC. The existing KF represents this line using
+    # its values at SOC 0 and 1, so no change to the KF's equations is needed.
+    residual_v = intercept + slope * soc - voltage
+    return {
+        "ocv_intercept_v": float(intercept),
+        "ocv_slope_v_per_soc": float(slope),
+        "ocv_at_empty_v": float(intercept),
+        "ocv_at_full_v": float(intercept + slope),
+        "rmse_v": float(np.sqrt(np.mean(residual_v**2))),
+        "max_error_v": float(np.max(np.abs(residual_v))),
+    }
+
+
+def build_nonlinear_ocv_model(soc_points, ocv_points_v):
+    """Return (ocv_function, ocv_derivative_function) for estimate_soc_ekf().
+
+    Supply settled samples covering SOC 0 to 1. PCHIP joins the original points
+    with smooth cubic pieces and preserves the shape of the sampled curve.
+    Its derivative supplies dOCV/dSOC in volts per unit SOC to the EKF Jacobian.
+    Both callables accept a scalar or NumPy array of SOC fractions from 0 to 1.
+    Queries outside this range or containing nonfinite values raise ValueError.
+    Interpolation follows the simulated samples; it does not validate the cell.
+    """
+    soc, voltage = _validate_ocv_points(soc_points, ocv_points_v)
+    interpolator = PchipInterpolator(soc, voltage, extrapolate=False)
+    derivative = interpolator.derivative()
+
+    def check_soc(query_soc):
+        # Reject extrapolation instead of silently clipping the input or
+        # predicting unmeasured voltages beyond the ends of the lookup table.
+        query = np.asarray(query_soc, dtype=float)
+        if not np.isfinite(query).all() or np.any((query < 0) | (query > 1)):
+            raise ValueError("Lookup SOC must be finite and between 0 and 1.")
+        return query
+
+    def ocv_function(query_soc):
+        return interpolator(check_soc(query_soc))
+
+    def ocv_derivative_function(query_soc):
+        return derivative(check_soc(query_soc))
+
+    return ocv_function, ocv_derivative_function
+
+
 def show_ocv_soc_curve(results):
-    """Print the points and display the rested-voltage curve."""
+    """Print samples and KF fit error, then compare both OCV models on a plot."""
     soc_percent = results["soc_points"] * 100
     voltage_v = results["ocv_points_v"]
     settled = results["settled_points"]
@@ -217,11 +304,48 @@ def show_ocv_soc_curve(results):
     ):
         print(f"{soc:7.1f}   {voltage:18.4f}   {drift:10.4f}   {is_settled}")
 
-    # Connecting sample points helps visualize the curve; it is not a fitted
-    # KF line or an EKF interpolation function yet. Those are later steps.
+    # Only build filter models when all points pass the settling check and the
+    # full SOC range is available. Partial experiments can still be inspected.
+    linear_model = None
+    if settled.all():
+        try:
+            linear_model = fit_linear_ocv_model(results["soc_points"], voltage_v)
+            ocv_function, _ = build_nonlinear_ocv_model(results["soc_points"], voltage_v)
+        except ValueError as error:
+            linear_model = None
+            print(f"Filter models unavailable: {error}")
+    else:
+        print("Filter models unavailable: some voltage points need a longer rest.")
+
+    if linear_model is not None:
+        print(
+            f"KF fitted OCV: {linear_model['ocv_intercept_v']:.6f} + "
+            f"{linear_model['ocv_slope_v_per_soc']:.6f} * SOC (SOC from 0 to 1)"
+        )
+        print(
+            f"KF voltage error at samples: RMSE {linear_model['rmse_v'] * 1000:.2f} mV; "
+            f"maximum {linear_model['max_error_v'] * 1000:.2f} mV"
+        )
+
     figure, axis = plt.subplots(figsize=(9, 5))
-    axis.plot(soc_percent, voltage_v, color="gray", linewidth=1)
-    axis.scatter(soc_percent[settled], voltage_v[settled], label="Settling check passed")
+    if linear_model is not None:
+        # A dense SOC grid shows how each approximation behaves between samples.
+        plot_soc = np.linspace(0, 1, 501)
+        axis.plot(
+            plot_soc * 100,
+            linear_model["ocv_intercept_v"] + linear_model["ocv_slope_v_per_soc"] * plot_soc,
+            linestyle="--", color="tab:orange", label="KF: least-squares line",
+        )
+        axis.plot(
+            plot_soc * 100, ocv_function(plot_soc),
+            color="tab:blue", label="EKF: PCHIP lookup",
+        )
+    else:
+        axis.plot(soc_percent, voltage_v, color="gray", linewidth=1)
+    axis.scatter(
+        soc_percent[settled], voltage_v[settled],
+        color="black", s=16, label="Rested samples (settled)",
+    )
     if not settled.all():
         axis.scatter(
             soc_percent[~settled], voltage_v[~settled],
