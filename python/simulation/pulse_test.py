@@ -2,8 +2,8 @@
 
 Run this file to plot a rest, discharge pulse, and recovery rest. It reuses the
 Ai2020/EEMB configuration and capacity reference from battery_simulation.py.
-The returned data will support later R0, R1, and C1 fitting; this file does not
-fit those parameters or run the SOC estimators yet.
+The returned data supports R0, R1, and C1 fitting in fit_ecm.py; this file
+generates characterization data and plots without running SOC estimators.
 """
 
 import matplotlib.pyplot as plt

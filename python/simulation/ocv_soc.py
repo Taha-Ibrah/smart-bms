@@ -9,7 +9,7 @@ invalid calculation. Neither convention calibrates the model to the EEMB cell.
 The result is a simulated OCV approximation from the borrowed Ai2020 chemistry.
 The helpers below turn settled points into a fitted KF line and an EKF voltage
 lookup with its derivative. Both use SOC fractions from 0 to 1, not percentages.
-R0, R1, and C1 identification will be a separate step after this curve exists.
+R0, R1, and C1 identification lives separately in fit_ecm.py.
 """
 
 import warnings

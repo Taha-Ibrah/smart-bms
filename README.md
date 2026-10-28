@@ -13,9 +13,10 @@ protection control have not been implemented.
 
 Clarify the model and build the estimator comparison one step at a time.
 The OCV–SOC experiment now supplies a fitted linear model for the KF and a
-nonlinear lookup with its derivative for the EKF. A simulated pulse test now
-generates current-switch and voltage-recovery data. **The immediate next task is
-to fit R0, R1, and C1 from that response.** OCV means open-circuit voltage: the
+nonlinear lookup with its derivative for the EKF. The pulse-response fitter now
+identifies R0/R1/C1 and predicts a separate validation pulse. **The immediate
+next task is to build shared evaluation profiles and compare the estimators.**
+OCV means open-circuit voltage: the
 battery voltage after resting without a load.
 
 The three estimator implementations exist, but there is no complete comparison
@@ -69,15 +70,17 @@ meaning for its 0% point.
 | Battery simulation and plots | [battery_simulation.py](python/simulation/battery_simulation.py) | Implemented; EEMB approximation needs calibration |
 | Repeatable sensor noise and bias | [sensor_noise.py](python/simulation/sensor_noise.py) | Implemented; noise settings are initial assumptions |
 | Rested OCV–SOC experiment | [ocv_soc.py](python/simulation/ocv_soc.py) | Implemented; settling checks, KF least-squares line, and EKF lookup/derivative |
-| Simulated pulse response | [pulse_test.py](python/simulation/pulse_test.py) | Implemented; rest/pulse/recovery data and plots, parameter fitting pending |
+| Simulated pulse response | [pulse_test.py](python/simulation/pulse_test.py) | Implemented; rest/pulse/recovery data and plots |
+| One-RC parameter identification | [fit_ecm.py](python/simulation/fit_ecm.py) | Implemented; R0/R1/C1 fitting and separate-pulse voltage validation |
 | Coulomb counting | [coulomb_counter.py](python/estimation/coulomb_counter.py) | Implemented |
-| Linear, one-state KF | [kalman_filter.py](python/estimation/kalman_filter.py) | Implemented; fitted OCV line available, resistance identification pending |
-| Two-state EKF: SOC and polarization voltage | [ekf.py](python/estimation/ekf.py) | Implemented; OCV lookup/derivative available, R0/R1/C1 identification pending |
+| Linear, one-state KF | [kalman_filter.py](python/estimation/kalman_filter.py) | Implemented; fitted OCV line and local R0 available, comparison pending |
+| Two-state EKF: SOC and polarization voltage | [ekf.py](python/estimation/ekf.py) | Implemented; OCV lookup/derivative and local R0/R1/C1 available, comparison pending |
 | Estimation notes | [soc_estimation.pdf](python/estimation/soc_estimation.pdf) | Reference document |
 | Arduino sensors, calibration, and serial protocol | [arduino_firmware/](arduino_firmware/) | Empty placeholders |
 | Shared comparison plots and dashboard | [python/visualization/](python/visualization/) | Empty placeholders; simulation plots already work |
-| Automated tests | [python/tests/](python/tests/) | Simulation/OCV regression checks implemented; estimator and database test files remain placeholders |
-| Database and Docker setup | [python/database/](python/database/), [docker/](docker/) | Empty placeholders; optional supporting work |
+| Automated tests | [python/tests/](python/tests/) | Simulation/OCV/pulse and circuit-fit checks implemented; dedicated estimator and database test files remain placeholders |
+| SQLite storage | [python/database/](python/database/) | Empty placeholders; required for the Phase 1 pipeline |
+| Docker setup | [docker/](docker/) | Empty placeholder; optional supporting work |
 
 The filters do not receive the simulated SOC reference as an input. It is
 reserved for evaluating their estimates. Positive current means discharge,
@@ -170,8 +173,8 @@ The caller must check settling before fitting; the plot shows only raw samples
 if settling or full-range coverage fails.
 
 Use `curve["usable_capacity_ah"]` for both filters' `nominal_capacity_ah` argument
-to keep the SOC reference consistent. The KF still needs series resistance and
-the EKF needs R0, R1, and C1 before a meaningful loaded-cell comparison.
+to keep the SOC reference consistent. Obtain the KF's series resistance and
+the EKF's R0/R1/C1 from the pulse-response fitter below.
 
 Generate a simulated current pulse and voltage-recovery plot:
 
@@ -199,15 +202,48 @@ The function returns clean `time_s`, `current_a`, `voltage_v`, `temperature_c`,
 reference, per-sample `phase`, and switch indices/times. Both sides of each
 switch are preserved; do not round or resample them away before identifying
 the immediate voltage jump. Incomplete conditioning or a cutoff-truncated
-pulse raises an error. The module generates data only; R0/R1/C1 fitting and
-the estimator comparison remain to be implemented. Future fitted values will
-describe this surrogate under the selected conditions and still need hardware
-validation.
+pulse raises an error. The module generates characterization data; `fit_ecm.py`
+identifies the circuit parameters from it. The estimator comparison remains to
+be implemented, and fitted values still need hardware validation.
 
-Run the focused simulation, OCV-model, and pulse regression tests:
+Fit a one-RC voltage model and predict a separate pulse:
 
 ```bash
-python -m unittest python.tests.test_simulation -v
+python python/simulation/fit_ecm.py
+```
+
+The script builds the nonlinear OCV lookup and fits a **0.4 A, 60 s** pulse
+near **50% reference SOC**. It averages the load-on/load-off jump estimates for
+R0, then uses
+[SciPy least squares](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.least_squares.html)
+to fit positive R1 and the RC time constant. C1 is derived from that time
+constant and R1. Pulse and recovery receive equal influence in the objective;
+reported voltage RMSE values are unweighted. No voltage offset is fitted.
+
+Identification starts at the final pre-pulse rest sample, assuming zero initial
+polarization. It uses reference SOC to account for changing OCV; this is offline
+model identification, not an input given to the SOC estimators. The helper
+rejects a pre-pulse OCV mismatch above its default 1 mV tolerance and requires
+both sides of each current switch. Numerical search bounds and bound-hit status
+are available in the returned fit.
+
+The same parameters then predict a separately generated **0.8 A, 120 s** pulse
+without refitting. The plot compares predicted voltage with PyBaMM voltage and
+shows the residuals. These are voltage-model errors, not SOC estimator results.
+Parameters describe a local surrogate approximation; broader SOC/temperature
+validation is needed before treating them as valid across an entire discharge.
+
+For reuse, `run_ecm_fit()` returns `fit`, `validation`, and `ocv_curve` entries.
+The fit contains `r0_ohm`, `r1_ohm`, `c1_f`, `tau_s`, jump estimates, optimizer
+status, and `training` predictions/errors. Use its R0 as the KF's
+`internal_resistance_ohm`, and pass R0/R1/C1 to the EKF's corresponding arguments.
+`predict_ecm_voltage()` predicts voltage from supplied current and SOC;
+`evaluate_ecm()` reports errors using fixed parameters.
+
+Run the simulation and parameter-fitting regression tests:
+
+```bash
+python -m unittest python.tests.test_simulation python.tests.test_fit_ecm -v
 ```
 
 These commands run simulations only. They do not connect to an Arduino, charge
@@ -215,10 +251,9 @@ a battery, or control a physical load.
 
 ## Roadmap
 
-1. **Prepare the filter model.** The rested OCV–SOC curve and filter OCV inputs
-   are implemented. Next fit a 1-RC equivalent circuit using pulse-response data.
-   Obtain R0 for the immediate voltage drop and R1/C1 for voltage relaxation.
-   Keep identification data separate from evaluation data.
+1. **Prepare the filter model.** OCV inputs and a local 1-RC fit are implemented,
+   with separate-pulse validation. Extend characterization across operating
+   conditions as needed, keeping identification data separate from evaluation.
 2. **Compare all three estimators.** Replay the same noisy measurements through
    Coulomb counting, KF, and EKF. Plot SOC estimates and errors; report RMSE and
    maximum absolute error in SOC percentage points. Include changing loads,
