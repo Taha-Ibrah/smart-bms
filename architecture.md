@@ -25,7 +25,6 @@ smart_bms/
 ├── README.md
 ├── battery_specs.md
 ├── quick_notes.md
-├── pybamm_practice.py
 ├── .gitignore
 ├── python/
 │   ├── simulation/
@@ -33,21 +32,24 @@ smart_bms/
 │   │   ├── sensor_noise.py
 │   │   ├── ocv_soc.py
 │   │   ├── pulse_test.py
-│   │   └── fit_ecm.py
+│   │   ├── fit_ecm.py
+│   │   └── profiles.py
 │   ├── estimation/
 │   │   ├── coulomb_counter.py
 │   │   ├── kalman_filter.py
 │   │   └── ekf.py
+│   ├── evaluation/
+│   │   └── compare_estimators.py
 │   ├── visualization/
-│   │   ├── plots.py
-│   │   └── dashboard.py
+│   │   └── plots.py
 │   ├── database/
 │   │   ├── database.py
 │   │   └── schema.sql
 │   └── tests/
 │       ├── test_simulation.py
 │       ├── test_fit_ecm.py
-│       ├── test_etimators.py
+│       ├── test_profiles.py
+│       ├── test_comparison.py
 │       └── test_database.py
 ├── arduino_firmware/
 │   ├── bms_monitor.ino
@@ -61,7 +63,13 @@ smart_bms/
     └── docker-compose.yml
 ```
 
-## Root files: documentation and learning
+Python source files belong inside the matching responsibility folder under
+`python/`; `evaluation/` owns comparison workflow and metrics. The SQLite schema,
+database helper, and database tests own persistence. Generated output belongs
+under `results/`, which is ignored by Git. Optional features do not need empty
+Python files.
+
+## Root files: documentation and repository configuration
 
 | File | Status | Purpose |
 | --- | --- | --- |
@@ -69,8 +77,7 @@ smart_bms/
 | [README.md](README.md) | Implemented | Project introduction, setup/run commands, model assumptions, and roadmap. Dependencies are currently documented here; there is no dependency manifest yet. |
 | [battery_specs.md](battery_specs.md) | Implemented | Selected EEMB LP103454 specifications, sources, operating limits, and differences between the physical cell and the Ai2020 simulation surrogate. |
 | [quick_notes.md](quick_notes.md) | Implemented | Short learning notes, currently explaining Ah and the simulated 2.153 Ah capacity reference. |
-| [pybamm_practice.py](pybamm_practice.py) | Implemented | Standalone learning experiment comparing default-SPM discharge at 0.5C, 1C, and 2C. It uses its own default configuration and is separate from the shared EEMB simulation pipeline. |
-| [.gitignore](.gitignore) | Implemented | Excludes generated Python bytecode and cache directories from normal Git tracking. |
+| [.gitignore](.gitignore) | Implemented | Excludes generated Python bytecode, cache directories, and `results/` output from normal Git tracking. |
 
 ## `python/simulation/`: generate battery data and characterize the model
 
@@ -80,10 +87,11 @@ and identification of the simpler voltage model needed by the filters.
 | File | Status | Purpose |
 | --- | --- | --- |
 | [battery_simulation.py](python/simulation/battery_simulation.py) | Implemented | Defines the shared SPM/Ai2020 model, lumped temperature model, battery metadata, and project limits through `create_battery_configuration()`. `run_battery_simulation()` performs the reference discharge to cutoff and returns clean current, voltage, temperature, capacity, and reference SOC. `show_simulation_results()` plots those results. |
-| [sensor_noise.py](python/simulation/sensor_noise.py) | Implemented | `add_sensor_noise()` adds repeatable Gaussian noise and fixed bias to clean voltage/current/temperature arrays while retaining the clean reference data. `print_sensor_error_summary()` reports measurement errors. Noise settings are initial assumptions. |
+| [sensor_noise.py](python/simulation/sensor_noise.py) | Implemented | `add_sensor_noise()` adds configurable, seeded Gaussian noise and fixed bias while retaining clean arrays. Returns the settings used; `print_sensor_error_summary()` reports errors. Noise settings are initial assumptions. |
 | [ocv_soc.py](python/simulation/ocv_soc.py) | Implemented | Generates rested voltage versus SOC, checks settling, fits the KF's straight OCV line, and builds the EKF's nonlinear OCV lookup and derivative. Its plot compares voltage models with rested samples; it does not show estimated SOC. |
 | [pulse_test.py](python/simulation/pulse_test.py) | Implemented | Conditions the battery to a requested reference SOC, then simulates rest, a discharge-current pulse, and recovery. Returns clean measurements, cumulative discharged Ah, phase labels, and current-switch indices/times. Its plot shows the battery's voltage response; fitting belongs to `fit_ecm.py`. |
 | [fit_ecm.py](python/simulation/fit_ecm.py) | Implemented | Estimates R0 from both voltage jumps, fits positive R1 and the RC time constant with SciPy, and derives C1. Uses OCV at reference SOC for offline identification. Predicts voltage, reports errors, and validates unchanged parameters on a separate pulse. |
+| [profiles.py](python/simulation/profiles.py) | Implemented | Defines constant-discharge, changing-load, and charge/discharge evaluation profiles with rest periods. `run_test_profile()` conditions the shared model to a requested SOC, excludes preparation from evaluation, preserves current switches, and checks cutoff/step completion. `show_test_profile()` plots clean measurements and reference SOC. |
 
 The reference discharge, OCV experiment, and pulse experiment reuse the same
 configuration. Their current capacity reference is approximately 2.153 Ah at
@@ -107,7 +115,55 @@ voltage predictor from supplied SOC/current, not an SOC estimator.
 the default 0.4 A/60 s pulse and validates a separate 0.8 A/120 s pulse near
 50% SOC. `show_ecm_fit()` displays voltage predictions/errors. The fitted
 values are local to the surrogate and test conditions, rather than globally
-validated cell parameters. The complete estimator comparison is still pending.
+validated cell parameters. Evaluation profiles remain separate from these
+characterization experiments and never enter the fitting optimizer.
+
+## `python/evaluation/`: coordinate the software comparison
+
+[compare_estimators.py](python/evaluation/compare_estimators.py) is implemented.
+`run_comparison()` characterizes the model once, generates each evaluation
+profile near 50% SOC, adds noise, and calls all three estimators with the same
+measured arrays and capacity reference. It returns measurements, estimates,
+metrics, characterization results, and settings. It does not change estimator
+equations or tune filters against the evaluation SOC reference.
+
+Each profile has three scenarios: nominal initialization at 50%, an initial
+estimate of 40% using the identical measurements, and an increased current
+offset of +50 mA instead of +10 mA. The bias scenario preserves the random
+noise realization and voltage/temperature measurements. Each profile's noise
+seed is recorded; by default it is the supplied seed plus its position in the
+requested profile list.
+
+`calculate_soc_metrics()` reports:
+
+- Time-weighted SOC RMSE and maximum absolute sampled error, in percentage points.
+- Convergence time: the first sampled time within ±2 percentage points followed
+  by at least 60 seconds continuously inside that band. `None` means no
+  qualifying interval was demonstrated; zero means it began at the first sample.
+- Drift: a time-weighted linear trend in signed error over the final 300 seconds,
+  in percentage points/hour. The window boundary is interpolated and the exact
+  interval is returned. This is a local trend, not a long-term drift prediction.
+
+The tolerance, hold duration, and drift window are configurable. Explicit,
+fixed filter settings are reused across scenarios. `print_comparison_summary()`
+prints the metrics, and `save_comparison_summary()` optionally exports
+`metrics.csv` and `metadata.json`. The CLI calls the shared plotting function
+and can save PNGs without opening windows. It saves full comparison results to
+`results/smart_bms.sqlite3` by default, using the database helpers below.
+
+From the repository root, run `python -m python.evaluation.compare_estimators`.
+Direct execution via `python python/evaluation/compare_estimators.py` is also
+supported. `--database PATH` changes the storage location; `--no-store` skips
+SQLite writing. `--load-id ID` reopens a comparison from the chosen database,
+prints its stored metrics, and plots its stored estimates without simulation,
+filter execution, or insertion of another comparison. Both normal and loaded
+results support `--save-dir` exports and `--no-show` headless execution.
+
+These short profiles cover only a few SOC percentage points near the pulse fit.
+The global straight OCV line can bias the KF; neither filter is guaranteed to
+outperform correctly initialized Coulomb counting on a short test. Charge
+behavior is evaluated using parameters fitted from discharge pulses. These are
+local surrogate comparisons, not full-range or hardware accuracy claims.
 
 ## `python/estimation/`: calculate SOC from measurements
 
@@ -129,24 +185,43 @@ not currently an input to any of these estimators.
 
 | File | Status | Intended purpose |
 | --- | --- | --- |
-| [plots.py](python/visualization/plots.py) | Empty placeholder | Reusable plots of reference SOC versus all three estimates, SOC error over time, and metric comparisons. Consume computed results rather than rerunning estimators. |
-| [dashboard.py](python/visualization/dashboard.py) | Empty placeholder | Optional interactive interface for viewing measurements and results after the core pipeline works. |
+| [plots.py](python/visualization/plots.py) | Implemented | `plot_estimator_comparison()` consumes completed results and creates one figure per profile: reference/estimated SOC above signed SOC error, with a column for each scenario, RMSE labels, and convergence-tolerance guides. Optionally saves PNGs and opens windows; returns the figures. |
 
 The existing discharge, OCV, pulse, and circuit-fit plots live in their simulation
-modules. The empty visualization files do not generate those plots.
+modules. An interactive dashboard is an optional future extension; it has no
+source file yet.
 
 ## `python/database/`: retain reproducible Phase 1 results in SQLite
 
-| File | Status | Intended purpose |
+| File | Status | Purpose |
 | --- | --- | --- |
-| [database.py](python/database/database.py) | Empty placeholder | Python interface for creating/opening SQLite storage and writing or reading runs, measurements, estimates, and metrics. |
-| [schema.sql](python/database/schema.sql) | Empty placeholder | Define SQLite tables, relationships, and constraints so each measurement, estimate, and result can be traced to a run. |
+| [database.py](python/database/database.py) | Implemented | `initialize_database(path)` creates the schema, `save_comparison(path, results)` appends one complete comparison and returns its ID, `load_comparison(path, id)` restores the comparison dictionary and NumPy arrays, and `list_comparisons(path)` lists IDs, creation times, and scenario counts. Uses standard-library `sqlite3`. |
+| [schema.sql](python/database/schema.sql) | Implemented | Defines five related tables with foreign keys and sample-based associations, preserving the relationship between an experiment, its scenarios, measurements, estimator outputs, and metrics. |
 
-Run metadata should record the profile, battery/model settings, capacity/SOC
-reference, noise seed and bias settings, estimator parameters, initialization,
-and metric definitions. Store the simulated reference and noisy measurements
-separately so evaluation can be reproduced. SQLite storage is required for
-Phase 1; it has not been implemented yet.
+The storage hierarchy is:
+
+- `comparisons`: one complete experiment, such as a single CLI invocation;
+  includes creation time and comparison-level settings/characterization metadata.
+- `scenarios`: one profile and initialization/noise case within that experiment;
+  retains scenario and measurement metadata.
+- `measurements`: clean current (A), terminal voltage (V), temperature (°C),
+  discharged capacity (Ah), reference SOC (fraction), and noisy sensor readings
+  at each time (s). Sample index determines order and identifies samples;
+  timestamps need not be unique.
+- `estimates`: estimated SOC (fraction) by scenario, estimator, and sample index.
+- `metrics`: each estimator's summary for a scenario, including RMSE/maximum
+  error (SOC percentage points), convergence (s), and drift (percentage
+  points/hour). A missing convergence time is SQL `NULL`, not a zero.
+
+Each save appends a new comparison in one transaction. Foreign-key checks
+protect associations; a failed save must not leave a partial comparison behind.
+JSON metadata preserves additional NumPy arrays and characterization results,
+along with battery/model settings, the capacity/SOC reference, noise seed and
+bias settings, estimator inputs, initialization, metric definitions, and software
+versions.
+Loading restores data for the existing summary, metric, and plotting functions;
+it does not regenerate measurements or estimates. The database is local and
+requires no server or additional Python dependency.
 
 ## `python/tests/`: check correctness automatically
 
@@ -154,12 +229,13 @@ Phase 1; it has not been implemented yet.
 | --- | --- | --- |
 | [test_simulation.py](python/tests/test_simulation.py) | Implemented | `unittest` checks for capacity/SOC consistency, voltage cutoff, OCV fitting/interpolation, pulse behavior, and input validation. Includes a small filter-interface check, rather than complete estimator coverage. |
 | [test_fit_ecm.py](python/tests/test_fit_ecm.py) | Implemented | Checks voltage prediction against closed-form RC responses, recovery of known circuit parameters, switch handling, invalid inputs, and prediction of a separate PyBaMM pulse without refitting. |
-| [test_etimators.py](python/tests/test_etimators.py) | Empty placeholder | Focused checks of Coulomb counting, KF, and EKF using controlled data with known expected behavior, including charge integration, filter updates, and invalid inputs. The current filename is misspelled; the intended spelling is `test_estimators.py`. |
-| [test_database.py](python/tests/test_database.py) | Empty placeholder | Check schema creation, saving/loading records, run associations, and preservation of measurement/estimate values. |
+| [test_profiles.py](python/tests/test_profiles.py) | Implemented | Checks all evaluation profiles, charge/discharge SOC integration, settled preparation, preserved switch samples, shared reference capacity, invalid settings, and cutoff rejection. |
+| [test_comparison.py](python/tests/test_comparison.py) | Implemented | Checks metrics against known errors and irregular timestamps, convergence/hold semantics, drift windows, configurable noise, and a real comparison run. Verifies shared measurements, isolated bias changes, and measured-only estimator inputs without requiring any estimator to win. |
+| [test_database.py](python/tests/test_database.py) | Implemented | Checks schema creation, complete comparison round trips, measurement/estimate preservation, sample ordering, nullable convergence, comparison associations, and transactional storage behavior. |
 
 `pulse_test.py` is a battery-characterization experiment. The files under
-`python/tests/` are automated software checks. The future comparison runner
-will measure estimator performance across scenarios; these are three distinct
+`python/tests/` are automated software checks. The comparison runner
+measures estimator performance across scenarios; these are three distinct
 responsibilities.
 
 ## `arduino_firmware/`: acquire hardware measurements in a later phase
@@ -187,27 +263,20 @@ exists. Porting the EKF to Arduino is a later stretch goal.
 | --- | --- | --- |
 | [docker-compose.yml](docker/docker-compose.yml) | Empty placeholder | Optional container/service configuration if the finished workflow needs it. No services are currently defined; SQLite does not require a separate database server. |
 
-## Planned Python additions: files not created yet
+## Remaining Phase 1 work
 
-These are the intended locations for the remaining pipeline responsibilities.
-Implement them one step at a time rather than creating empty files in advance.
-
-| Planned file | Responsibility |
-| --- | --- |
-| `python/simulation/profiles.py` | Define repeatable evaluation profiles, including changing loads and rest periods, using the shared battery configuration. Keep evaluation profiles separate from characterization data. |
-| `python/compare_estimators.py` | Coordinate the Phase 1 experiment: load/generate characterization inputs, simulate an evaluation profile, add sensor noise, run all three estimators on the same measurements, calculate metrics, call comparison plots, and save results/metadata to SQLite. |
-
-The comparison runner will own SOC RMSE, maximum absolute error, convergence
-time, and drift calculations. Report SOC RMSE and maximum error in percentage
-points, and convergence time in seconds. Record the tolerance and sustained
-duration used for convergence, and the interval/units used for drift. A wrong-initial-SOC
-case and current-bias case should be repeatable scenarios, not manual edits to
-the estimator implementations.
+The local simulation-to-estimator pipeline now includes plots, metrics, and
+SQLite save/load. Add focused estimator unit checks to the existing tests or
+introduce a correctly named `test_estimators.py` when implementing those checks.
+Then broaden SOC/temperature profiles and circuit-model validation without
+mixing fitting data into evaluation. Passing local software checks does not
+establish full-range SOC accuracy or replace physical-cell validation.
 
 ## Intended Phase 1 data flow
 
-The diagram includes planned connections. The complete end-to-end pipeline
-does not run yet.
+Simulation, estimation, metrics, plots, and SQLite persistence run end to end.
+Saved results can also be reopened for inspection without rerunning simulation
+or estimation.
 
 ```mermaid
 flowchart TD
@@ -216,19 +285,20 @@ flowchart TD
     B --> P[Pulse experiment: current and voltage response]
     O --> F[Fit R0, R1, C1 and validate voltage prediction]
     P --> F
-    B -.-> D[Planned: separate evaluation profiles]
-    D -.-> N[Sensor noise: measured voltage, current, temperature]
-    O -.-> E[Coulomb counting, KF, EKF]
-    F -.-> E
-    N -.-> E
-    E -.-> C[Planned comparison runner: SOC metrics]
-    D -. Reference SOC for scoring .-> C
-    C -.-> V[Planned comparison plots]
-    C -.-> S[Planned SQLite records and metadata]
+    B --> D[Separate evaluation profiles]
+    D --> N[Sensor noise: measured voltage, current, temperature]
+    O --> E[Coulomb counting, KF, EKF]
+    F --> E
+    N --> E
+    E --> C[Comparison runner: SOC metrics]
+    D -->|Reference SOC for scoring| C
+    C --> V[Comparison plots and optional CSV/JSON exports]
+    C --> S[SQLite measurements, estimates, metrics, and metadata]
+    S --> L[Load a saved comparison]
+    L --> V
 ```
 
-Solid arrows show the existing characterization dependency; dashed arrows
-show the intended comparison workflow. The OCV and fitted-circuit inputs apply
+Solid arrows show implemented data flow. The OCV and fitted-circuit inputs apply
 to the voltage-based filters; Coulomb counting needs current, capacity, and
 initial SOC.
 
@@ -244,7 +314,7 @@ initial SOC.
 | Capacity | Ah; use the same `usable_capacity_ah` reference for simulated reference SOC, OCV characterization, and estimator replay. |
 | Clean/reference arrays | `current_a`, `voltage_v`, `temperature_c`, `discharge_capacity_ah`, and `true_soc`. |
 | Noisy measurement arrays | `measured_current_a`, `measured_voltage_v`, and `measured_temp_c`. |
-| Estimator outputs | Time-aligned NumPy SOC arrays, later associated with run and estimator names by the comparison runner. |
+| Estimator outputs | Time-aligned NumPy SOC arrays, associated with profile, scenario, and estimator names by the comparison runner. |
 
 - Keep the shared battery configuration in `battery_simulation.py`; avoid
   copying different battery specifications into each experiment.
@@ -254,7 +324,7 @@ initial SOC.
 - Keep sensor noise separate from clean simulation data so the reference
   remains available and every estimator sees the same noisy readings.
 - Keep model identification in simulation modules, filter mathematics in
-  estimation modules, and workflow coordination in the comparison runner.
+  estimation modules, and workflow coordination and metrics in `evaluation/`.
 - Keep computation callable without opening plots. Existing simulation modules
   use separate `show_*` functions and direct-execution guards for this purpose.
 - Treat Ai2020 as a surrogate for the EEMB cell. Software consistency tests and
