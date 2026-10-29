@@ -1,7 +1,8 @@
 """Generate repeatable evaluation data, separate from the ECM fitting pulses.
 
-Positive current discharges the battery; negative current charges it. All three
-profiles start near 50% SOC, where our present R0/R1/C1 fit was characterized.
+Positive current discharges the battery; negative current charges it. Profiles
+default to 50% SOC and 25 C, where our present R0/R1/C1 fit was characterized.
+Other initial SOC and ambient temperatures test how that fixed fit generalizes.
 Conditioning and the one-hour settling rest are excluded from returned data.
 These are local software evaluation profiles, not hardware test instructions.
 """
@@ -37,12 +38,17 @@ def run_test_profile(
     sample_period_s=1.0,
     pre_rest_duration_s=3600.0,
     reference_data=None,
+    *,
+    ambient_temperature_c=25.0,
 ):
     """Return clean V/I/T/reference-SOC arrays for one evaluation profile.
 
     reference_data may be the capacity-test result or generated OCV-curve data;
     supplying it avoids repeating the capacity test for each profile. Its usable
     capacity defines SOC exactly as in battery_simulation.py and ocv_soc.py.
+    Changing ambient temperature changes the simulated cell, while the supplied
+    reference capacity and its SOC scale remain fixed. With no supplied reference,
+    the capacity test still runs at the default characterization temperature, 25 C.
 
     The battery is conditioned from full, then rested for at least one hour.
     Evaluation starts at t=0 after that rest. Both sides of every current switch
@@ -61,7 +67,9 @@ def run_test_profile(
     if sample_period_s > min(duration for _, duration in steps):
         raise ValueError("sample_period_s cannot exceed the shortest profile step.")
 
-    model, parameters, specs = create_battery_configuration()
+    model, parameters, specs = create_battery_configuration(
+        ambient_temperature_c=ambient_temperature_c,
+    )
     for current, duration in steps:
         if not np.isfinite(current) or not np.isfinite(duration) or duration <= 0:
             raise ValueError("Profile currents must be finite and durations positive and finite.")
@@ -152,6 +160,7 @@ def run_test_profile(
     return {
         **specs, **data,
         "usable_capacity_ah": capacity_ah,
+        "reference_capacity_temperature_c": float(reference.get("ambient_temperature_c", 25.0)),
         "soc_reference": reference["soc_reference"],
         "profile_name": profile_name,
         "target_soc": float(target_soc),

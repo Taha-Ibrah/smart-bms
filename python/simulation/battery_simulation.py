@@ -16,12 +16,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def create_battery_configuration():
+def create_battery_configuration(*, ambient_temperature_c=25.0):
     """Return a fresh model, parameters, and shared battery specifications.
 
     The normal discharge simulation and the OCV experiment both call this
     function so their chemistry, capacity, geometry, and limits stay aligned.
+    Temperature experiments start the cell at the requested ambient temperature;
+    calls without that keyword retain the 25 C characterization configuration.
     """
+    if isinstance(ambient_temperature_c, (bool, np.bool_)):
+        raise ValueError("ambient_temperature_c must be finite and between 0 and 45 C.")
+    try:
+        ambient_temperature_c = float(ambient_temperature_c)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "ambient_temperature_c must be finite and between 0 and 45 C."
+        ) from None
+    if not np.isfinite(ambient_temperature_c) or not 0 <= ambient_temperature_c <= 45:
+        raise ValueError("ambient_temperature_c must be finite and between 0 and 45 C.")
     #SPM = Single Particle Model
     #Simplified Lithium-ion battery that runs quickly, captures important battery behavior, commonly used
     model = pybamm.lithium_ion.SPM(
@@ -73,8 +85,8 @@ def create_battery_configuration():
         "Cell cooling surface area [m2]": 2.0 * (
             length_m * width_m + length_m * thickness_m + width_m * thickness_m
         ),
-        "Initial temperature [K]": 298.15,
-        "Ambient temperature [K]": 298.15,
+        "Initial temperature [K]": ambient_temperature_c + 273.15,
+        "Ambient temperature [K]": ambient_temperature_c + 273.15,
     })
 
     battery_specs = {
@@ -97,6 +109,8 @@ def create_battery_configuration():
         "maximum_voltage_v": maximum_voltage_v,
         "minimum_temp_c": minimum_temp_c,
         "maximum_temp_c": maximum_temp_c,
+        "initial_temperature_c": ambient_temperature_c,
+        "ambient_temperature_c": ambient_temperature_c,
     }
     return model, parameter_values, battery_specs
 

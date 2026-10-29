@@ -13,7 +13,7 @@ import numpy as np
 
 
 def plot_estimator_comparison(results, save_dir=None, show=True):
-    """Return one SOC/error figure per profile, optionally saving PNG files.
+    """Return one SOC/error figure per operating condition, optionally saving PNGs.
 
     Each column represents an evaluation scenario. Axes share time within a
     column, while each scenario gets its own vertical scale: a large initial
@@ -23,7 +23,7 @@ def plot_estimator_comparison(results, save_dir=None, show=True):
     """
     grouped = {}
     for scenario in results["scenarios"]:
-        grouped.setdefault(scenario["profile_name"], []).append(scenario)
+        grouped.setdefault(scenario.get("condition_name", scenario["profile_name"]), []).append(scenario)
 
     tolerance = results["metric_settings"]["convergence_tolerance_pp"]
     colors = {"Coulomb counting": "tab:blue", "KF": "tab:orange", "EKF": "tab:green"}
@@ -32,13 +32,17 @@ def plot_estimator_comparison(results, save_dir=None, show=True):
         output_dir.mkdir(parents=True, exist_ok=True)
 
     figures = []
-    for profile_name, scenarios in grouped.items():
+    for condition_name, scenarios in grouped.items():
         figure, axes = plt.subplots(
             2, len(scenarios), figsize=(6 * len(scenarios), 8),
             sharex="col", squeeze=False, constrained_layout=True,
         )
+        first = scenarios[0]
+        context = ""
+        if "condition_name" in first:
+            context = f" — start {first['target_soc'] * 100:g}% SOC, {first['ambient_temperature_c']:g}°C ambient"
         figure.suptitle(
-            f"SOC estimator comparison: {profile_name.replace('_', ' ')}",
+            f"SOC estimator comparison: {first['profile_name'].replace('_', ' ')}{context}",
             fontsize=14,
         )
 
@@ -98,8 +102,10 @@ def plot_estimator_comparison(results, save_dir=None, show=True):
         if output_dir is not None:
             # Restrict filenames to a simple profile identifier even when a
             # caller supplies a descriptive title containing spaces or slashes.
-            filename = re.sub(r"[^A-Za-z0-9_-]+", "_", profile_name).strip("_") or "profile"
+            filename = re.sub(r"[^A-Za-z0-9_-]+", "_", condition_name).strip("_") or "profile"
             figure.savefig(output_dir / f"{filename}_comparison.png", dpi=160)
+            if not show:
+                plt.close(figure)
         figures.append(figure)
 
     if show and figures:

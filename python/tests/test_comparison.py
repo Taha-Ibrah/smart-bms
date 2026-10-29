@@ -9,18 +9,23 @@ Run from the repository root with either:
     python python/tests/test_comparison.py -v
 """
 
+import io
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from python.evaluation import compare_estimators
+from python.database.database import load_comparison, save_comparison
 from python.simulation.sensor_noise import add_sensor_noise
+from python.visualization.plots import plot_estimator_comparison
 
 
 class SOCMetricTests(unittest.TestCase):
@@ -316,6 +321,211 @@ class ComparisonPipelineTests(unittest.TestCase):
                     self.assertAlmostEqual(arguments["initial_soc"], scenario["initial_soc"])
                     self.assertNotIn("true_soc", arguments)
                     self.assertNotIn("reference_soc", arguments)
+
+
+class OperatingConditionGridTests(unittest.TestCase):
+    """Exercise fixed characterization across SOC and temperature conditions.
+
+    The comparison may expose poor estimates. These tests require correct data
+    flow, scoring, and persistence without requiring a particular winner.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with (
+            patch.object(compare_estimators, "run_ecm_fit", wraps=compare_estimators.run_ecm_fit) as fit,
+            patch.object(compare_estimators, "estimate_soc_kalman_filter", wraps=compare_estimators.estimate_soc_kalman_filter) as kf,
+            patch.object(compare_estimators, "estimate_soc_ekf", wraps=compare_estimators.estimate_soc_ekf) as ekf,
+        ):
+            cls.result = compare_estimators.run_comparison(
+                profile_names=("changing_load",), initial_socs=(0.1, 0.5, 0.9),
+                ambient_temperatures_c=(15, 25, 35), seed=42,
+            )
+        cls.fit_call_count = fit.call_count
+        cls.filter_calls = {"KF": kf.call_args_list, "EKF": ekf.call_args_list}
+        cls.conditions = {}
+        for scenario in cls.result["scenarios"]:
+            cls.conditions.setdefault(scenario["condition_name"], {})[scenario["scenario_name"]] = scenario
+
+    def test_grid_has_all_nine_conditions_and_three_scenarios_per_condition(self):
+        self.assertEqual(len(self.result["scenarios"]), 27)
+        self.assertEqual(len(self.conditions), 9)
+        self.assertEqual(
+            {(scenario["target_soc"], scenario["ambient_temperature_c"])
+             for scenario in self.result["scenarios"]},
+            {(soc, temperature) for soc in (0.1, 0.5, 0.9) for temperature in (15, 25, 35)},
+        )
+        for name, scenarios in self.conditions.items():
+            with self.subTest(condition=name):
+                self.assertEqual(set(scenarios), {"nominal", "wrong_initial_soc", "current_bias"})
+                nominal, wrong = scenarios["nominal"], scenarios["wrong_initial_soc"]
+                self.assertIs(nominal["data"], wrong["data"])
+                self.assertEqual(nominal["initial_soc"], nominal["target_soc"])
+                self.assertEqual(wrong["initial_soc"], max(0, nominal["target_soc"] - 0.1))
+                np.testing.assert_allclose(
+                    scenarios["current_bias"]["data"]["measured_current_a"] - nominal["data"]["measured_current_a"],
+                    0.04, rtol=0, atol=1e-14,
+                )
+
+    def test_temperature_and_initial_soc_metadata_match_actual_profile_physics(self):
+        reference_capacity = self.result["characterization"]["ocv_curve"]["usable_capacity_ah"]
+        for scenario in self.result["scenarios"]:
+            with self.subTest(condition=scenario["condition_name"], scenario=scenario["scenario_name"]):
+                data = scenario["data"]
+                self.assertEqual(data["target_soc"], scenario["target_soc"])
+                self.assertAlmostEqual(data["initial_soc"], scenario["target_soc"], places=12)
+                self.assertAlmostEqual(data["true_soc"][0], scenario["target_soc"], places=12)
+                self.assertEqual(data["ambient_temperature_c"], scenario["ambient_temperature_c"])
+                self.assertEqual(data["initial_temperature_c"], scenario["ambient_temperature_c"])
+                self.assertAlmostEqual(data["temperature_c"][0], scenario["ambient_temperature_c"], delta=1e-3)
+                self.assertEqual(data["reference_capacity_temperature_c"], 25)
+                self.assertEqual(data["usable_capacity_ah"], reference_capacity)
+
+    def test_characterization_and_filter_tuning_stay_fixed_across_the_grid(self):
+        self.assertEqual(self.fit_call_count, 1)
+        settings = self.result["evaluation_settings"]
+        self.assertTrue(settings["calibration_is_fixed"])
+        self.assertEqual(settings["calibration_soc"], 0.5)
+        self.assertEqual(settings["calibration_temperature_c"], 25)
+        self.assertEqual(settings["capacity_reference_temperature_c"], 25)
+        fit = self.result["characterization"]["fit"]
+        capacity = self.result["characterization"]["ocv_curve"]["usable_capacity_ah"]
+        for estimator, calls in self.filter_calls.items():
+            self.assertEqual(len(calls), 27)
+            for call in calls:
+                self.assertEqual(call.kwargs["nominal_capacity_ah"], capacity)
+                for name, value in self.result["estimator_settings"][estimator].items():
+                    self.assertEqual(call.kwargs[name], value)
+                if estimator == "KF":
+                    self.assertEqual(call.kwargs["internal_resistance_ohm"], fit["r0_ohm"])
+                    for name in ("ocv_at_empty_v", "ocv_at_full_v"):
+                        self.assertEqual(call.kwargs[name], self.result["linear_ocv_model"][name])
+                else:
+                    for name in ("r0_ohm", "r1_ohm", "c1_f"):
+                        self.assertEqual(call.kwargs[name], fit[name])
+
+    def test_every_scenario_includes_a_closed_kf_model_error_decomposition(self):
+        contribution_names = (
+            "ocv_nonlinearity_mean_pp", "unmodeled_dynamics_mean_pp",
+            "voltage_sensor_error_mean_pp", "current_sensor_error_mean_pp",
+        )
+        for scenario in self.result["scenarios"]:
+            with self.subTest(condition=scenario["condition_name"], scenario=scenario["scenario_name"]):
+                diagnostic = scenario["kf_model_diagnostics"]
+                self.assertTrue(all(np.isfinite(value) for value in diagnostic.values()))
+                self.assertAlmostEqual(
+                    sum(diagnostic[name] for name in contribution_names),
+                    diagnostic["voltage_implied_soc_error_mean_pp"], places=10,
+                )
+                self.assertLess(diagnostic["decomposition_residual_max_abs_pp"], 1e-10)
+                self.assertAlmostEqual(diagnostic["reference_soc_min"], scenario["data"]["true_soc"].min())
+                self.assertAlmostEqual(diagnostic["reference_soc_max"], scenario["data"]["true_soc"].max())
+
+    def test_whole_grid_round_trips_through_sqlite_and_preserves_scores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            comparison_id = save_comparison(path, self.result)
+            restored = load_comparison(path, comparison_id)
+        self.assertEqual(len(restored["scenarios"]), 27)
+        self.assertEqual(restored["evaluation_settings"], self.result["evaluation_settings"])
+        self.assertEqual(restored["estimator_settings"], self.result["estimator_settings"])
+        self.assertEqual(restored["software_versions"], self.result["software_versions"])
+        for original, loaded in zip(self.result["scenarios"], restored["scenarios"]):
+            for name in ("condition_name", "target_soc", "ambient_temperature_c", "scenario_name", "initial_soc"):
+                self.assertEqual(loaded[name], original[name])
+            self.assertEqual(loaded["kf_model_diagnostics"], original["kf_model_diagnostics"])
+            self.assertEqual(loaded["data"]["reference_capacity_temperature_c"], 25)
+            np.testing.assert_array_equal(loaded["data"]["true_soc"], original["data"]["true_soc"])
+        # Recompute several cases from reloaded measurements and estimates;
+        # storage must preserve enough precision to reproduce the same scores.
+        for scenario in (restored["scenarios"][0], restored["scenarios"][13], restored["scenarios"][-1]):
+            for estimator, estimate in scenario["estimates"].items():
+                recomputed = compare_estimators.calculate_soc_metrics(
+                    scenario["data"]["time_s"], scenario["data"]["true_soc"], estimate,
+                    **restored["metric_settings"],
+                )
+                for name, value in recomputed.items():
+                    if name == "drift_interval_s":
+                        np.testing.assert_allclose(scenario["metrics"][estimator][name], value, atol=1e-12)
+                    elif value is None:
+                        self.assertIsNone(scenario["metrics"][estimator][name])
+                    else:
+                        self.assertAlmostEqual(scenario["metrics"][estimator][name], value, places=12)
+
+    def test_plots_group_by_condition_and_save_unique_files(self):
+        selected = {**self.result, "scenarios": self.result["scenarios"][:6]}
+        figures = []
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                figures = plot_estimator_comparison(selected, save_dir=directory, show=False)
+                files = list(Path(directory).glob("*_comparison.png"))
+                self.assertEqual(len(figures), 2)
+                self.assertEqual(len(files), 2)
+                self.assertEqual(len({path.name for path in files}), 2)
+                self.assertTrue(all(path.stat().st_size > 0 for path in files))
+                for figure in figures:
+                    self.assertEqual(len(figure.axes), 6)
+                    self.assertEqual(sum(axis.get_ylabel() == "SOC (%)" for axis in figure.axes), 3)
+                    self.assertIn("changing load", figure._suptitle.get_text())
+                    self.assertIn("15°C", figure._suptitle.get_text())
+        finally:
+            for figure in figures:
+                plt.close(figure)
+
+
+class OperatingConditionArgumentTests(unittest.TestCase):
+    def test_invalid_grids_are_rejected_before_characterization(self):
+        cases = (
+            {"initial_socs": ()}, {"initial_socs": (0.5, 0.5)},
+            {"initial_socs": (0,)}, {"initial_socs": (-0.1,)},
+            {"initial_socs": (1.1,)}, {"initial_socs": (np.nan,)},
+            {"initial_socs": (np.inf,)}, {"initial_socs": 0.5},
+            {"initial_socs": ((0.1, 0.5),)},
+            {"ambient_temperatures_c": ()}, {"ambient_temperatures_c": (25, 25)},
+            {"ambient_temperatures_c": (-1,)}, {"ambient_temperatures_c": (46,)},
+            {"ambient_temperatures_c": (np.nan,)}, {"ambient_temperatures_c": (np.inf,)},
+            {"ambient_temperatures_c": 25}, {"ambient_temperatures_c": ((15, 25),)},
+        )
+        for settings in cases:
+            with self.subTest(settings=settings), patch.object(compare_estimators, "run_ecm_fit") as fit:
+                with self.assertRaises(ValueError):
+                    compare_estimators.run_comparison(profile_names=("changing_load",), **settings)
+                fit.assert_not_called()
+
+    def test_cli_passes_explicit_grid_flags_to_comparison(self):
+        argv = [
+            "compare_estimators", "--profiles", "changing_load", "--soc-starts", ".1", ".9",
+            "--temperatures", "15", "35", "--no-store", "--no-show",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(compare_estimators, "run_comparison", return_value={}) as run,
+            patch.object(compare_estimators, "print_comparison_summary"),
+            patch.object(compare_estimators, "save_comparison") as save,
+            patch.object(compare_estimators, "plot_estimator_comparison") as plot,
+        ):
+            compare_estimators.main()
+        run.assert_called_once_with(
+            ["changing_load"], seed=42, initial_socs=[0.1, 0.9], ambient_temperatures_c=[15, 35],
+        )
+        save.assert_not_called()
+        plot.assert_not_called()
+
+    def test_loading_rejects_grid_overrides_before_loading_or_simulating(self):
+        for flag, values in (("--soc-starts", [".1", ".9"]), ("--temperatures", ["15", "35"])):
+            with (
+                self.subTest(flag=flag),
+                patch.object(sys, "argv", ["compare_estimators", "--load-id", "1", flag, *values]),
+                patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+                patch.object(compare_estimators, "load_comparison") as load,
+                patch.object(compare_estimators, "run_comparison") as run,
+            ):
+                with self.assertRaises(SystemExit) as error:
+                    compare_estimators.main()
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn("--load-id uses stored settings", stderr.getvalue())
+                load.assert_not_called()
+                run.assert_not_called()
 
 
 if __name__ == "__main__":

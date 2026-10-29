@@ -15,8 +15,10 @@ The Python pipeline now characterizes the model, generates shared evaluation
 profiles, adds sensor noise, and compares all three SOC estimators with plots
 and accuracy metrics. SQLite now retains the measurements, estimates, metrics,
 and metadata so a comparison can be reopened without rerunning PyBaMM or the
-filters. **Next: add focused estimator checks and broaden SOC/temperature
-validation.** Hardware validation has not started.
+filters. Direct mathematical estimator tests and a broader SOC/temperature
+comparison are now implemented; see [validation.md](validation.md) for results
+and limitations. **Next: build Arduino acquisition and a Python serial logger,
+keeping estimation offline in Python.** Hardware validation has not started.
 
 OCV means open-circuit voltage: the battery voltage after resting without a
 load. Its fitted straight line supplies the KF, while a nonlinear lookup and
@@ -38,7 +40,7 @@ Full specifications, sources, and assumptions are in [battery_specs.md](battery_
 | Parameter set | Ai2020, an Enertech LCO/graphite starting point |
 | Target nominal capacity | 2.0 Ah; electrode area also scaled from Ai2020's 2.28 Ah |
 | Temperature model | Lumped: one average temperature for the cell |
-| Initial cell and ambient temperature | 25 °C |
+| Initial cell and ambient temperature | 25 °C by default; evaluation profiles can vary both together |
 | Initial SOC | 100%, assumed for simulation |
 | Experiment | Rest for 10 minutes, then discharge at 0.2C = 0.4 A |
 | Capacity-test stopping condition | Reach 3.0 V; reject the test if the 10-hour time guard ends it first |
@@ -77,10 +79,11 @@ meaning for its 0% point.
 | Linear, one-state KF | [kalman_filter.py](python/estimation/kalman_filter.py) | Implemented; evaluated with fitted OCV line and local R0 |
 | Two-state EKF: SOC and polarization voltage | [ekf.py](python/estimation/ekf.py) | Implemented; evaluated with nonlinear OCV and local R0/R1/C1 |
 | Shared evaluation profiles | [profiles.py](python/simulation/profiles.py) | Implemented; constant discharge, changing load, charge/discharge, and rest periods |
-| Estimator comparison | [compare_estimators.py](python/evaluation/compare_estimators.py) | Implemented; shared noisy inputs, three scenarios per profile, four metrics, optional CSV/JSON exports |
+| Estimator comparison | [compare_estimators.py](python/evaluation/compare_estimators.py) | Implemented; shared noisy inputs, selectable SOC/temperature grid, three scenarios per condition, four metrics, optional CSV/JSON exports |
+| KF model diagnosis | [model_diagnostics.py](python/evaluation/model_diagnostics.py) | Implemented; offline decomposition of voltage-implied SOC error into OCV-line mismatch, unmodeled dynamics, and sensor errors |
 | Arduino sensors, calibration, and serial protocol | [arduino_firmware/](arduino_firmware/) | Empty placeholders |
 | Shared comparison plots | [plots.py](python/visualization/plots.py) | Implemented; actual estimated SOC and signed error against the simulation reference |
-| Automated tests | [python/tests/](python/tests/) | Simulation, circuit-fit, profile, metric, noise, comparison, and database checks implemented |
+| Automated tests | [python/tests/](python/tests/) | Direct estimator mathematics plus simulation, circuit-fit, profile, metric, noise, comparison, diagnostic, and database checks implemented |
 | SQLite storage | [python/database/](python/database/) | Implemented; append-only comparisons with measurements, estimates, metrics, and metadata; save/load integrated into the runner |
 | Docker setup | [docker/](docker/) | Empty placeholder; optional supporting work |
 
@@ -232,8 +235,9 @@ are available in the returned fit.
 The same parameters then predict a separately generated **0.8 A, 120 s** pulse
 without refitting. The plot compares predicted voltage with PyBaMM voltage and
 shows the residuals. These are voltage-model errors, not SOC estimator results.
-Parameters describe a local surrogate approximation; broader SOC/temperature
-validation is needed before treating them as valid across an entire discharge.
+Parameters describe a local surrogate approximation. The broader comparison
+below tests how that unchanged fit generalizes; it does not establish validity
+across an entire discharge.
 
 For reuse, `run_ecm_fit()` returns `fit`, `validation`, and `ocv_curve` entries.
 The fit contains `r0_ohm`, `r1_ohm`, `c1_f`, `tau_s`, jump estimates, optimizer
@@ -248,13 +252,34 @@ Compare all three estimators on the shared evaluation profiles:
 python -m python.evaluation.compare_estimators
 ```
 
-This runs constant discharge, changing load, and charge/discharge profiles.
+By default this runs constant discharge, changing load, and charge/discharge profiles.
 Each begins near 50% reference SOC after a one-hour settling rest. Preparation
 is excluded from evaluation. Each profile is replayed with an initial estimate
 of 50%, a wrong estimate of 40%, and an increased current bias (+50 mA instead
 of +10 mA). The first two cases reuse identical readings; the bias case changes
 only the current offset, preserving the random noise draws. Noise settings and
-each profile's seed are recorded in the returned results.
+each condition's seed are recorded in the returned results.
+
+Evaluate the three profiles at starting SOCs of 10%, 50%, and 90% and ambient
+temperatures of 15, 25, and 35 °C:
+
+```bash
+python -m python.evaluation.compare_estimators --soc-starts 0.1 0.5 0.9 --temperatures 15 25 35 --database results/validation.sqlite3 --save-dir results/validation --no-show
+```
+
+This creates 27 profile/SOC/temperature conditions, each with three scenarios:
+81 scenarios and 243 estimator traces. Nominal initialization uses the requested
+starting SOC; wrong initialization is 10 percentage points lower, floored at
+zero. These remain short windows starting at three SOC levels, rather than
+full-discharge tests. The completed grid is saved as comparison 1 in
+`results/validation.sqlite3`; the report is [validation.md](validation.md).
+
+The capacity reference and OCV lookup stay fixed at 25 °C, and the circuit fit
+stays fixed near 50% SOC at 25 °C. The grid changes the simulated cell's initial
+and ambient temperatures together, leaving filter parameters and tuning
+unchanged. Temperature is logged but is not an estimator input or a compensation
+mechanism. This tests generalization of the existing model rather than fitting
+a new model at every evaluation condition.
 
 Each figure contains actual estimated SOC above signed SOC error, with one
 column per scenario. The terminal reports time-weighted RMSE and maximum error
@@ -269,8 +294,9 @@ Run one profile and save plots, metrics, and metadata without opening windows:
 python -m python.evaluation.compare_estimators --profiles changing_load --save-dir results/comparison --no-show
 ```
 
-The output folder contains one PNG per selected profile, `metrics.csv`, and
-`metadata.json`. A completed comparison is also saved by default to
+The output folder contains one PNG per profile/SOC/temperature condition,
+`metrics.csv`, `kf_diagnostics.csv`, and `metadata.json`. SOC and temperature
+identify each condition in the exports. A completed comparison is also saved by default to
 `results/smart_bms.sqlite3`, including the full measurement and estimate arrays.
 The terminal reports the comparison ID needed to reopen it. `results/` contains
 generated output and is excluded from Git tracking.
@@ -278,8 +304,8 @@ generated output and is excluded from Git tracking.
 Use `--database PATH` to choose another SQLite file, or `--no-store` to compute
 without saving to SQLite. With `--no-show` alone, the runner prints metrics and
 saves the comparison without creating figures. Use `--seed` to choose a
-repeatable noise realization; each profile uses that seed plus its position in
-the requested list.
+repeatable noise realization; each condition uses that seed plus its position
+in temperature, starting-SOC, then profile order.
 
 Reopen a saved comparison, using the ID printed when it was stored:
 
@@ -290,7 +316,8 @@ python -m python.evaluation.compare_estimators --load-id 1
 Add `--database PATH` if it was stored elsewhere. Loading prints the stored
 metrics and plots the stored estimates; it does not rerun simulation or
 estimation and does not insert another comparison. `--save-dir` and `--no-show`
-also work when reopening results.
+also work when reopening results. Older comparisons without grid or diagnostic
+metadata remain loadable and plottable.
 
 The database helpers can also be called from Python:
 
@@ -310,7 +337,8 @@ package is needed. Each save appends a complete comparison in one transaction.
 Clean/reference readings and noisy sensor readings occupy separate fields, and
 sample indices preserve current-switch samples even when timestamps repeat.
 Stored metadata includes noise settings, capacity/SOC reference, model inputs,
-estimator settings, initialization, metric definitions, and software versions.
+estimator settings, initialization, metric definitions, evaluation grid,
+condition labels, offline KF diagnostics, and software versions.
 Restored results can be passed to the existing summary and plotting functions.
 
 Run module commands from the repository root. Direct execution is also supported
@@ -322,15 +350,29 @@ Filter settings are fixed across scenarios and have not been tuned against the
 evaluation reference. With current defaults, short tests can favor correctly
 initialized Coulomb counting, while the EKF can correct a wrong initial SOC.
 The KF's full-range straight OCV approximation produces a larger bias here.
-These profiles span only a few SOC points near the local circuit fit, and the
-charge profile uses parameters identified from discharge pulses. Results do not
-establish full-range or physical-cell accuracy.
+The offline diagnostic separates its voltage-implied SOC error into four
+contributions: the straight-line OCV mismatch, unmodeled battery dynamics,
+voltage-sensor error, and current-sensor error. The OCV-line mismatch is the main
+contribution in the tested grid and worsens at low SOC. This decomposition
+explains the model's voltage-implied SOC, not the KF's actual filtered output.
+Reference SOC supports this diagnosis after estimation; the diagnosis never
+feeds back into the filters or retunes them. See [validation.md](validation.md).
+
+Each profile spans only a few SOC percentage points, and charge profiles use
+parameters identified from discharge pulses. The broader grid does not establish
+full-range or physical-cell accuracy.
 
 Run all automated checks:
 
 ```bash
 python -m unittest discover -s python/tests -v
 ```
+
+The full suite currently passes **130 tests**. The focused
+[estimator tests](python/tests/test_estimators.py) compare charge
+integrals, hand-calculated KF/EKF updates, and known nonlinear one-RC trajectories
+without PyBaMM. They also check initialization, offset drift, covariance
+stability, derivatives, clipping, and input validation.
 
 These commands run simulations only. They do not connect to an Arduino, charge
 a battery, or control a physical load.
@@ -340,10 +382,12 @@ a battery, or control a physical load.
 1. **Prepare the filter model.** OCV inputs and a local 1-RC fit are implemented,
    with separate-pulse validation. Extend characterization across operating
    conditions as needed, keeping identification data separate from evaluation.
-2. **Validate Phase 1 more broadly.** Shared profiles, estimator replay,
+2. **Validate Phase 1.** Shared profiles, estimator replay,
    SOC/error plots, RMSE/maximum error/convergence/drift metrics, and SQLite
-   storage are implemented. Add focused estimator unit checks, then evaluate
-   broader SOC and temperature conditions and check circuit-model validity.
+   storage are implemented. Direct estimator mathematics and short profiles
+   starting at 10%, 50%, and 90% SOC at 15, 25, and 35 °C have been checked.
+   See [validation.md](validation.md); full-cycle and hardware accuracy remain
+   separate validation work.
 3. **Build Arduino acquisition.** Begin with voltage logging, then add current
    and temperature. Use the planned ADS1115, INA226, and NTC thermistor. Power
    the Uno through USB and use a separate controlled battery load. Log timestamps,

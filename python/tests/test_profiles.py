@@ -16,7 +16,7 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from python.simulation import profiles
-from python.simulation.battery_simulation import run_battery_simulation
+from python.simulation.battery_simulation import create_battery_configuration, run_battery_simulation
 
 
 class EvaluationProfileTests(unittest.TestCase):
@@ -26,6 +26,17 @@ class EvaluationProfileTests(unittest.TestCase):
         cls.results = {
             name: profiles.run_test_profile(name, reference_data=cls.reference)
             for name in profiles.PROFILE_STEPS
+        }
+        cls.temperature_grid = {
+            (soc, temperature): (
+                cls.results["changing_load"] if (soc, temperature) == (0.5, 25)
+                else profiles.run_test_profile(
+                    "changing_load", target_soc=soc,
+                    ambient_temperature_c=temperature, reference_data=cls.reference,
+                )
+            )
+            for soc in (0.1, 0.5, 0.9)
+            for temperature in (15, 25, 35)
         }
 
     def test_profiles_start_from_settled_half_soc_and_omit_conditioning(self):
@@ -76,7 +87,71 @@ class EvaluationProfileTests(unittest.TestCase):
         reference = {key: self.reference[key] for key in ("usable_capacity_ah", "soc_reference")}
         result = profiles.run_test_profile(reference_data=reference)
         self.assertAlmostEqual(result["initial_soc"], 0.5)
+        self.assertEqual(result["reference_capacity_temperature_c"], 25)
         np.testing.assert_allclose(result["true_soc"], self.results["changing_load"]["true_soc"], atol=1e-12)
+
+    def test_configuration_sets_initial_and_ambient_temperature_together(self):
+        for temperature in (0, 15, 25, 35, 45):
+            with self.subTest(temperature=temperature):
+                _, parameters, specs = create_battery_configuration(ambient_temperature_c=temperature)
+                self.assertEqual(parameters["Initial temperature [K]"], temperature + 273.15)
+                self.assertEqual(parameters["Ambient temperature [K]"], temperature + 273.15)
+                self.assertEqual(specs["initial_temperature_c"], temperature)
+                self.assertEqual(specs["ambient_temperature_c"], temperature)
+        _, parameters, _ = create_battery_configuration()
+        self.assertEqual(parameters["Initial temperature [K]"], 298.15)
+        self.assertEqual(parameters["Ambient temperature [K]"], 298.15)
+
+    def test_soc_temperature_grid_keeps_reference_capacity_and_charge_balance(self):
+        expected_ah = sum(current * duration / 3600 for current, duration in profiles.PROFILE_STEPS["changing_load"])
+        duration_s = sum(duration for _, duration in profiles.PROFILE_STEPS["changing_load"])
+        for (soc, temperature), data in self.temperature_grid.items():
+            with self.subTest(soc=soc, temperature=temperature):
+                self.assertAlmostEqual(data["initial_soc"], soc, places=12)
+                self.assertEqual(data["usable_capacity_ah"], self.reference["usable_capacity_ah"])
+                self.assertEqual(data["soc_reference"], self.reference["soc_reference"])
+                self.assertEqual(data["reference_capacity_temperature_c"], 25)
+                self.assertEqual(data["initial_temperature_c"], temperature)
+                self.assertEqual(data["ambient_temperature_c"], temperature)
+                # Conditioning may warm the cell; the following one-hour rest
+                # returns it close to ambient, rather than resetting its state.
+                self.assertAlmostEqual(data["temperature_c"][0], temperature, delta=1e-3)
+                self.assertAlmostEqual(data["time_s"][-1], duration_s, places=6)
+                self.assertEqual(len(data["step_start_indices"]), len(profiles.PROFILE_STEPS["changing_load"]))
+                self.assertAlmostEqual(np.trapezoid(data["current_a"], data["time_s"]) / 3600, expected_ah, places=9)
+                self.assertAlmostEqual(data["true_soc"][-1], soc - expected_ah / self.reference["usable_capacity_ah"], places=12)
+                np.testing.assert_allclose(data["true_soc"], 1 - data["discharge_capacity_ah"] / self.reference["usable_capacity_ah"], atol=1e-12)
+                for key in ("time_s", "current_a", "voltage_v", "temperature_c", "true_soc"):
+                    self.assertTrue(np.isfinite(data[key]).all())
+                self.assertTrue((data["true_soc"] > 0).all())
+                self.assertTrue((data["true_soc"] < 1).all())
+                self.assertGreater(data["voltage_v"].min(), data["minimum_voltage_v"])
+                self.assertLess(data["voltage_v"].max(), data["maximum_voltage_v"])
+
+    def test_temperature_changes_cell_response_without_changing_soc_scale(self):
+        for soc in (0.1, 0.5, 0.9):
+            with self.subTest(soc=soc):
+                cold = self.temperature_grid[soc, 15]
+                warm = self.temperature_grid[soc, 35]
+                np.testing.assert_allclose(cold["true_soc"], warm["true_soc"], atol=1e-12)
+                self.assertGreater(np.max(np.abs(cold["voltage_v"] - warm["voltage_v"])), 1e-5)
+                self.assertGreater(np.min(warm["temperature_c"] - cold["temperature_c"]), 19)
+
+    def test_default_capacity_reference_stays_at_25_c_for_temperature_evaluation(self):
+        with patch.object(profiles, "run_battery_simulation", return_value=self.reference) as capacity_test:
+            data = profiles.run_test_profile(ambient_temperature_c=35)
+        capacity_test.assert_called_once_with()
+        self.assertEqual(data["ambient_temperature_c"], 35)
+        self.assertEqual(data["reference_capacity_temperature_c"], 25)
+        self.assertEqual(data["usable_capacity_ah"], self.reference["usable_capacity_ah"])
+
+    def test_invalid_temperature_is_rejected_before_solving(self):
+        for temperature in (-0.01, 45.01, np.nan, np.inf, -np.inf, None, True):
+            with self.subTest(temperature=temperature):
+                with self.assertRaisesRegex(ValueError, "ambient_temperature_c"):
+                    create_battery_configuration(ambient_temperature_c=temperature)
+                with self.assertRaisesRegex(ValueError, "ambient_temperature_c"):
+                    profiles.run_test_profile(ambient_temperature_c=temperature, reference_data=self.reference)
 
     def test_invalid_settings_and_exhaustion_are_rejected(self):
         cases = (
@@ -101,8 +176,13 @@ class EvaluationProfileTests(unittest.TestCase):
         # Enough reference charge remains, but a large internal voltage drop
         # terminates this deliberately stressful profile before its 30 seconds.
         with patch.dict(profiles.PROFILE_STEPS, {"cutoff_fixture": ((0, 60), (4, 30), (0, 60))}):
-            with self.assertRaisesRegex(RuntimeError, "Evaluation profile reached a voltage limit"):
-                profiles.run_test_profile("cutoff_fixture", target_soc=0.03, reference_data=self.reference)
+            for temperature in (15, 25, 35):
+                with self.subTest(temperature=temperature):
+                    with self.assertRaisesRegex(RuntimeError, "Evaluation profile reached a voltage limit"):
+                        profiles.run_test_profile(
+                            "cutoff_fixture", target_soc=0.03,
+                            ambient_temperature_c=temperature, reference_data=self.reference,
+                        )
 
 
 if __name__ == "__main__":
